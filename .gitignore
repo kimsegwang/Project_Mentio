@@ -1,0 +1,18 @@
+# 가상환경
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 환경 변수 및 보안 키
+.env
+
+# 모델 및 미디어 임시 파일
+*.wav
+*.mp3
+*.jpg
+*.png
+models/
+
+# VS Code 설정
+.vscode/
