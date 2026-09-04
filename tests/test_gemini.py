@@ -1,16 +1,16 @@
 """
-Project Mentio - Gemini Brain & Action Schema Module
-- Pydantic 기반 구조화된 JSON 강제 출력 (Structured Output)
-- FireBeetle 2 ESP32-S3 제어 규격 정의 (표정, 대사, WS2812B RGB)
+Project Mentio - Gemini Brain Latency & Stability Optimized
+- gemini-flash-latest 모델 적용
+- max_output_tokens 확보로 JSON 잘림 방지
 """
 
 import os
 import sys
+import time
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-# 프로젝트 루트 경로 참조
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import settings
 
@@ -38,24 +38,31 @@ def test_gemini_brain(prompt: str):
 
     system_instruction = (
         "당신은 감정을 표현하는 탁상형 반려로봇 'Mentio'입니다. "
-        "사용자의 말과 입력 상황에 반응하여 적절한 감정(emotion), 자연스러운 한국어 대사(speech), "
-        "로봇 눈/가슴에 점등할 RGB LED 색상(led_rgb)을 항상 지정된 JSON 규격으로만 출력하세요."
+        "사용자의 말과 상황에 반응하여 적절한 감정(emotion), 짧고 명확한 한국어 대사 1~2문장(speech), "
+        "RGB LED 색상(led_rgb)을 지정된 JSON 규격으로만 즉시 출력하세요. 서두 인사나 마크다운 없이 순수 JSON만 반환하세요."
     )
 
     print(f"질의 전송 중: '{prompt}'...")
 
+    start_time = time.perf_counter()
+
     response = client.models.generate_content(
-        model="gemini-3.6-flash",  # 현재 공식 기본 플래시 모델
+        model="gemini-flash-latest",
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
             response_schema=RobotAction,
+            temperature=0.7,
+            max_output_tokens=1000,  # JSON이 중간에 잘리지 않도록 충분히 확보
         ),
     )
 
+    elapsed_time = time.perf_counter() - start_time
+
     print("\n=== Gemini 정형 응답 ===")
     print(response.text)
+    print(f"\n[성능 측정] 총 응답 소요 시간: {elapsed_time:.2f}초")
 
 
 if __name__ == "__main__":
