@@ -1,19 +1,23 @@
 """
-Project Mentio - Vision to Gemini Brain Pipeline Integration Test
-1. 손하트(BIG_HEART) 감지: 실시간 제스처 트리거 -> 감정 반응
-2. 상황 인지 질의 (스냅샷 VLM): 's' 키 입력 시 카메라 1회 스냅샷 분석 -> 상황 묘사 대사
+Project Mentio - Vision to Gemini Brain Pipeline Integration Test (Non-blocking Threaded)
+1. 손하트(BIG_HEART) 감지: 실시간 제스처 트리거 -> 백그라운드 큐 전달
+2. 상황 인지 질의 (스냅샷 VLM): 's' 키 입력 시 카메라 1회 스냅샷 -> 백그라운드 큐 전달
+3. 메인 루프: 30fps 비전 프리뷰 유지 (화면 멈춤 현상 완전 제거)
 """
 
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import cv2
 from google import genai
 from google.genai import types
 from PIL import Image
-from pydantic import BaseModel, Field
+from typing import List
+from typing_extensions import TypedDict
 
 # 프로젝트 루트 경로 설정 및 모듈 로드
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,22 +33,15 @@ except ImportError:
     from tests.test_gesture import HeartDetector
 
 
-class RobotAction(BaseModel):
-    emotion: str = Field(
-        description="로봇 표정 상태 (HAPPY, SAD, ANGRY, HEART_EYES, NEUTRAL, THINKING)"
-    )
-    speech: str = Field(
-        description="사용자에게 음성으로 전달할 한국어 답변 대사 (친근하고 귀여운 로봇 구어체, 1~2문장)"
-    )
-    led_rgb: list[int] = Field(
-        description="FireBeetle 2 GPIO 5번에 연결된 WS2812B LED 색상 [R, G, B] (각 0~255)",
-        min_length=3,
-        max_length=3,
-    )
+class RobotAction(TypedDict):
+    emotion: str  # 로봇 표정: HAPPY, SAD, ANGRY, HEART_EYES, NEUTRAL, THINKING
+    speech: str   # 1~2문장의 한국어 구어체 대사
+    led_rgb: List[int]  # [R, G, B] 각 0~255
 
 
 # Client를 1회만 초기화하여 세션 재사용 (지연 시간 단축)
 _GENAI_CLIENT = None
+
 
 def get_genai_client() -> genai.Client | None:
     global _GENAI_CLIENT
@@ -78,18 +75,24 @@ def parse_robot_action_json(raw_text: str) -> dict | None:
         return None
 
 
-def call_gemini_action(contents: list | str, max_retries: int = 1) -> dict | None:
-    """타임아웃(10초) 및 지수 백오프 적용 추론 함수"""
+def call_gemini_action(contents: list | str) -> dict:
+    fallback_response = {
+        "emotion": "THINKING",
+        "speech": "주변을 열심히 보고 있는데 지금은 생각이 조금 복잡해요!",
+        "led_rgb": [200, 200, 0],
+    }
+
     client = get_genai_client()
     if not client:
         print("[오류] GEMINI_API_KEY가 설정되지 않았습니다.")
-        return None
+        return fallback_response
 
     system_instruction = (
         "당신은 탁상형 반려로봇 'Mentio'입니다. "
-        "카메라로 본 사물을 1초 만에 스캔하여 즉시 반응하세요. "
-        "사족이나 생각 과정 없이, 감정(emotion), 한국어 1문장 대사(speech), "
-        "RGB 색상(led_rgb)을 JSON 규격으로만 즉시 출력하세요."
+        "사용자의 제스처나 카메라 영상을 보고 반응하세요. "
+        "사족 없이 지정된 JSON 형식으로만 즉시 출력하세요. "
+        "emotion은 HAPPY, SAD, ANGRY, HEART_EYES, NEUTRAL 중 하나를 선택하고, "
+        "speech는 친근한 한국어 1~2문장, led_rgb는 [R, G, B] 리스트여야 합니다."
     )
 
     config = types.GenerateContentConfig(
@@ -97,74 +100,84 @@ def call_gemini_action(contents: list | str, max_retries: int = 1) -> dict | Non
         response_mime_type="application/json",
         response_schema=RobotAction,
         temperature=0.2,
-        max_output_tokens=400,
+        max_output_tokens=1500,
     )
 
-    for attempt in range(max_retries + 1):
+    start_time = time.perf_counter()
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=contents,
+            config=config,
+        )
+        elapsed_time = time.perf_counter() - start_time
+        print(f"⏱️ [Gemini 응답 완료] 소요 시간: {elapsed_time:.2f}초")
+        print(f"📦 [출력 데이터]: {response.text}")
+
+        parsed_data = parse_robot_action_json(response.text)
+        if parsed_data:
+            return parsed_data
+
+        return json.loads(response.text.strip())
+
+    except Exception as e:
+        err_msg = str(e)
+        elapsed_time = time.perf_counter() - start_time
+        if "400" in err_msg:
+            print(f"⚠️ [파라미터 오류 400]: {err_msg}")
+        elif "429" in err_msg:
+            print("⏳ [호출 한도 429] 쿼터 초과. 잠시 대기 필요.")
+        else:
+            print(f"⚠️ [API 예외]: {e}")
+        return fallback_response
+
+
+# =======================================================
+# 백그라운드 VLM 추론 워커 루프
+# =======================================================
+def vlm_worker_thread(task_queue: queue.Queue, result_queue: queue.Queue):
+    """
+    메인 스레드로부터 작업(action_type, payload)을 전달받아
+    동기식 Gemini 호출을 백그라운드에서 처리한 뒤 결과를 result_queue로 전달
+    """
+    while True:
+        task = task_queue.get()
+        if task is None:  # 종료 신호 수신
+            task_queue.task_done()
+            break
+
+        action_type, payload = task
+        action_result = None
+
         try:
-            start_time = time.perf_counter()
-            response = client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=contents,
-                config=config,
-            )
-            elapsed_time = time.perf_counter() - start_time
-            print(f"⏱️ [Gemini 응답 완료] 소요 시간: {elapsed_time:.2f}초")
-            print(f"📦 [출력 데이터]: {response.text}")
+            if action_type == "SNAPSHOT":
+                # frame 리사이징 및 PIL Image 변환
+                frame = payload
+                h, w = frame.shape[:2]
+                target_w = 480
+                target_h = int(h * (target_w / w))
+                resized_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(rgb_frame)
 
-            parsed_data = parse_robot_action_json(response.text)
-            if parsed_data:
-                return parsed_data
+                prompt = "앞에 있는 물건이나 사람의 상태를 한눈에 보고, 귀엽고 친근하게 한 문장으로 즉시 말해줘."
+                action_result = call_gemini_action(contents=[pil_image, prompt])
 
-            return json.loads(response.text.strip())
+            elif action_type == "GESTURE":
+                prompt = "[비전 제스처 감지] 사용자가 카메라를 향해 양손으로 예쁜 손하트를 보냈습니다. 이에 알맞은 로봇 반응을 출력해줘."
+                action_result = call_gemini_action(contents=prompt)
 
         except Exception as e:
-            err_msg = str(e)
-            elapsed_time = time.perf_counter() - start_time
-
-            if "Deadline Exceeded" in err_msg or "timed out" in err_msg.lower() or "timeout" in err_msg.lower():
-                print(f"⏱️ [타임아웃 차단] 응답이 10초를 초과하여 강제 종료했습니다. (소요: {elapsed_time:.1f}초)")
-                break
-
-            if "503" in err_msg and attempt < max_retries:
-                print(f"⚠️ 일시 트래픽 과부하(503). 1초 후 재시도... ({attempt + 1}/{max_retries})")
-                time.sleep(1.0)
-            elif "429" in err_msg:
-                print("⏳ [호출 한도 도달] API 쿼터 한도에 도달했습니다. 잠시 후 시도해 주세요.")
-                break
-            else:
-                print(f"⚠️ [API 호출 실패]: {e}")
-                return None
-
-    # 서버 실패/타임아웃 시 기본 안내 반응 반환
-    return {
-        "emotion": "THINKING",
-        "speech": "주변을 열심히 보고 있는데 지금은 생각이 조금 복잡해요!",
-        "led_rgb": [200, 200, 0],
-    }
-
-
-def trigger_gesture_event() -> dict | None:
-    """하트 제스처 감지 이벤트 처리"""
-    print("\n🧠 [제스처 이벤트 발생] 손하트 감지 -> Gemini 추론")
-    prompt = "[비전 제스처 감지] 사용자가 카메라를 향해 양손으로 예쁜 손하트를 보냈습니다. 이에 알맞은 로봇 반응을 출력해줘."
-    return call_gemini_action(contents=prompt)
-
-
-def trigger_snapshot_vlm(frame) -> dict | None:
-    """스냅샷 전송 시 JPEG 압축 적용 (가로 480px 리사이징)"""
-    print("\n📸 [VLM 상황 인지] 카메라 프레임 스냅샷 캡처 중...")
-
-    h, w = frame.shape[:2]
-    target_w = 480
-    target_h = int(h * (target_w / w))
-    resized_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-    rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(rgb_frame)
-
-    prompt = "앞에 있는 물건이나 사람의 상태를 한눈에 보고, 귀엽고 친근하게 한 문장으로 즉시 말해줘."
-    return call_gemini_action(contents=[pil_image, prompt])
+            print(f"❌ [워커 예외 발생]: {e}")
+            action_result = {
+                "emotion": "THINKING",
+                "speech": "생각하는 중에 잠시 멍해졌어요!",
+                "led_rgb": [200, 200, 0],
+            }
+        finally:
+            if action_result:
+                result_queue.put(action_result)
+            task_queue.task_done()
 
 
 def run_pipeline():
@@ -177,8 +190,19 @@ def run_pipeline():
     win_name = "Mentio - Vision & VLM Pipeline"
     cv2.namedWindow(win_name)
 
+    # 비동기 통신용 스레드 및 큐 구성
+    task_queue = queue.Queue(maxsize=1)   # 백프레셔 제어: 작업은 한 번에 1개만 대기
+    result_queue = queue.Queue()          # 메인 스레드 결과 수신용
+    
+    worker = threading.Thread(
+        target=vlm_worker_thread,
+        args=(task_queue, result_queue),
+        daemon=True
+    )
+    worker.start()
+
     print("\n=======================================================")
-    print("🎥 Mentio 비전 & VLM 파이프라인 통합 가동")
+    print("🎥 Mentio 비전 & VLM 파이프라인 가동 (Non-blocking UI)")
     print("- [손하트]: 양손 정밀 손하트 취하기 (자동 감지)")
     print("- [상황 인지]: 's' 키 누르기 (카메라 1회 스냅샷 분석)")
     print("- [수동 하트]: 't' 키 누르기")
@@ -188,101 +212,94 @@ def run_pipeline():
     last_trigger_time = 0.0
     cooldown_seconds = 6.0
     last_robot_speech = ""
+    current_emotion = "NEUTRAL"
+    current_led = [100, 100, 100]
+    is_processing = False  # VLM API 호출 진행 상태 플래그
 
-    while cap.isOpened():
-        if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
-            print("🛑 창 닫기 감지: 프로그램을 종료합니다.")
-            break
+    try:
+        while cap.isOpened():
+            # 1. 루프 시작 시점 창 닫힘 체크
+            if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                print("🛑 창 닫기(X) 감지: 프로그램을 종료합니다.")
+                break
 
-        success, frame = cap.read()
-        if not success:
-            continue
+            success, frame = cap.read()
+            if not success:
+                continue
 
-        frame = cv2.flip(frame, 1)
-        gesture, text, color, processed_frame = detector.process_frame(frame.copy())
+            frame = cv2.flip(frame, 1)
+            gesture, text, color, processed_frame = detector.process_frame(frame.copy())
 
-        current_time = time.perf_counter()
-        action_type = None
+            # 백그라운드 큐 수신
+            try:
+                res = result_queue.get_nowait()
+                last_robot_speech = res.get("speech", "")
+                current_emotion = res.get("emotion", "NEUTRAL")
+                current_led = res.get("led_rgb", [100, 100, 100])
+                is_processing = False
+                result_queue.task_done()
+            except queue.Empty:
+                pass
 
-        key = cv2.waitKey(1) & 0xFF
+            current_time = time.perf_counter()
+            action_type = None
 
-        if key == ord("q"):
-            print("🛑 'q' 키 입력: 프로그램을 종료합니다.")
-            break
-        elif key == ord("s"):
-            action_type = "SNAPSHOT"
-        elif key == ord("t"):
-            action_type = "GESTURE"
-        elif gesture == "HEART_EYES":
-            action_type = "GESTURE"
+            # 2. 키 입력 및 X 버튼 재확인
+            key = cv2.waitKey(1) & 0xFF
 
-        if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
-            break
+            if key == ord("q") or cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                print("🛑 종료 감지: 파이프라인을 종료합니다.")
+                break
+            elif key == ord("s"):
+                action_type = "SNAPSHOT"
+            elif key == ord("t"):
+                action_type = "GESTURE"
+            elif gesture == "HEART_EYES":
+                action_type = "GESTURE"
 
-        if action_type:
-            if current_time - last_trigger_time > cooldown_seconds:
-                last_trigger_time = current_time
+            # 3. 요청 전달 처리
+            if action_type:
+                if is_processing:
+                    text = f"{text} (Brain Thinking...)"
+                elif current_time - last_trigger_time > cooldown_seconds:
+                    last_trigger_time = current_time
+                    is_processing = True
+                    payload = frame.copy() if action_type == "SNAPSHOT" else None
+                    try:
+                        task_queue.put_nowait((action_type, payload))
+                    except queue.Full:
+                        is_processing = False
+                else:
+                    remaining = int(cooldown_seconds - (current_time - last_trigger_time))
+                    text = f"{text} (Cooldown {remaining}s)"
 
-                status_banner = "Analyzing Snapshot VLM..." if action_type == "SNAPSHOT" else "Calling Gemini Brain..."
-                cv2.putText(
-                    processed_frame,
-                    status_banner,
-                    (25, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2,
-                )
+            # 4. UI 오버레이 렌더링
+            if is_processing:
+                cv2.putText(processed_frame, "Mentio Brain: THINKING...", (25, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+
+            cv2.putText(processed_frame, text, (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(processed_frame, "[s] Snapshot VLM  |  [t] Heart Test  |  [q] Quit", (20, processed_frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+            if last_robot_speech:
+                cv2.putText(processed_frame, f"[{current_emotion}] Mentio: {last_robot_speech[:35]}...", (20, processed_frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+
+            bgr_led = (current_led[2], current_led[1], current_led[0])
+            cv2.circle(processed_frame, (processed_frame.shape[1] - 40, 40), 16, bgr_led, -1)
+            cv2.circle(processed_frame, (processed_frame.shape[1] - 40, 40), 18, (255, 255, 255), 2)
+
+            # 5. 프레임 표시 직전 최종 가시성 체크 (다시 켜짐 원천 차단)
+            if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) >= 1:
                 cv2.imshow(win_name, processed_frame)
-                cv2.waitKey(1)
 
-                action = None
-                if action_type == "SNAPSHOT":
-                    action = trigger_snapshot_vlm(frame)
-                elif action_type == "GESTURE":
-                    action = trigger_gesture_event()
-
-                if action:
-                    last_robot_speech = action.get("speech", "")
-            else:
-                remaining = int(cooldown_seconds - (current_time - last_trigger_time))
-                text = f"{text} (Cooldown {remaining}s)"
-
-        cv2.putText(
-            processed_frame,
-            text,
-            (25, 45),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            color,
-            2,
-        )
-
-        cv2.putText(
-            processed_frame,
-            "[s] Snapshot VLM  |  [t] Heart Test  |  [q] Quit",
-            (20, processed_frame.shape[0] - 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (200, 200, 200),
-            1,
-        )
-
-        if last_robot_speech:
-            cv2.putText(
-                processed_frame,
-                f"Mentio: {last_robot_speech[:38]}...",
-                (20, processed_frame.shape[0] - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 0),
-                2,
-            )
-
-        cv2.imshow(win_name, processed_frame)
-
-    cap.release()
-    cv2.destroyAllWindows()
+    finally:
+        # 종료 플래그 전달 및 클린업
+        try:
+            task_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        cap.release()
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)  # 윈도우 OS의 이벤트 루프 잔여 버퍼 비우기
 
 
 if __name__ == "__main__":
