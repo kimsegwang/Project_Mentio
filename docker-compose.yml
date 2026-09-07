@@ -1,0 +1,16 @@
+services:
+  mentio-db:
+    image: postgres:16-alpine
+    container_name: mentio-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: mentio_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - mentio_pgdata:/var/lib/postgresql/data
+
+volumes:
+  mentio_pgdata:
