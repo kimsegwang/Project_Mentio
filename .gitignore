@@ -1,18 +1,31 @@
-# 가상환경
+# 가상환경 및 파이썬 캐시
 .venv/
 venv/
+ENV/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# 환경 변수 및 보안 키
+# 환경 변수 및 보안 키 (필수)
 .env
+.env.local
 
 # 모델 및 미디어 임시 파일
 *.wav
 *.mp3
 *.jpg
+*.jpeg
 *.png
 models/
 
-# VS Code 설정
+# VS Code 및 OS 임시 파일
 .vscode/
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# 도커 및 데이터베이스 로컬 저장소
+postgres_data/
+*.log
