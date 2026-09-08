@@ -7,7 +7,13 @@ from google.genai import types
 from google.genai.errors import APIError
 
 from config import settings
-from server.schemas.action import RobotAction, FALLBACK_ACTION
+from server.schemas.action import LLMResponse, EmotionType
+
+# LLM 레벨 파싱 실패 시 기본 Fallback 응답
+DEFAULT_LLM_FALLBACK = LLMResponse(
+    emotion=EmotionType.ERROR,
+    speech="생각이 조금 엉켰어요. 잠시 후에 다시 말해줘!"
+)
 
 
 class BrainService:
@@ -15,8 +21,17 @@ class BrainService:
         self._client: Optional[genai.Client] = None
         self.system_instruction = (
             "너는 탁상형 반려로봇 Mentio의 두뇌 엔진이다. "
-            "주어진 시각/제스처 상황을 파악하고 친구처럼 다정하게 반응하라. "
-            "반드시 정의된 JSON 스키마 규격으로만 응답해야 한다."
+            "사용자가 건넨 말(텍스트)과 전달된 스냅샷 이미지를 종합해 친구처럼 다정하고 생동감 있게 반응하라.\n\n"
+            "[선택 가능한 감정]\n"
+            "- HAPPY: 반가운 인사, 일상 대화, 칭찬, 기분 좋은 상황\n"
+            "- PROUD: 사용자의 목표 달성 축하, 시험/업무 성공 격려, 멘티오의 자부심 표현\n"
+            "- CURIOUS: 스냅샷 속 물건에 대해 물어볼 때, 사용자의 질문에 호기심을 보일 때\n"
+            "- SAD: 속상한 일에 대한 공감, 아쉬움, 위로\n"
+            "- ANGRY: 사용자의 짓궂은 장난에 투덜거리거나 귀엽게 삐칠 때\n"
+            "- HEART_EYES: 스냅샷에서 양손 하트나 애정 표현이 확인되었을 때, 고마움을 표현할 때\n"
+            "- SURPRISED: 스냅샷 속 특이한 물체나 사용자의 뜻밖의 말에 깜짝 놀랐을 때\n"
+            "- TIRED: 사용자가 피로/지침을 호소하거나 멘티오가 함께 쉬자고 권유할 때\n\n"
+            "규칙: 반드시 위 8가지 감정 중 하나를 emotion으로 선택하고, 1~2문장의 자연스러운 한국어 구어체 speech를 생성하라."
         )
 
     def get_client(self) -> genai.Client:
@@ -28,26 +43,26 @@ class BrainService:
         return self._client
 
     @staticmethod
-    def parse_action_json(raw_text: str) -> RobotAction:
-        """사족 텍스트 제거 및 Pydantic RobotAction 객체 파싱"""
+    def parse_action_json(raw_text: str) -> LLMResponse:
+        """사족 텍스트 제거 및 Pydantic LLMResponse 객체 파싱"""
         try:
             cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.MULTILINE)
             cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
             json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
             if json_match:
-                return RobotAction.model_validate_json(json_match.group(0))
-            return RobotAction.model_validate_json(cleaned)
+                return LLMResponse.model_validate_json(json_match.group(0))
+            return LLMResponse.model_validate_json(cleaned)
         except Exception as e:
             print(f"[BrainService Error] JSON 파싱 실패: {e} -> Fallback 반환")
-            return FALLBACK_ACTION
+            return DEFAULT_LLM_FALLBACK
 
-    def infer_action(self, contents: List[Any]) -> RobotAction:
+    def infer_action(self, contents: List[Any]) -> LLMResponse:
         """Gemini API 호출 및 예외(503, 429, Timeout) 방어"""
         client = self.get_client()
         config = types.GenerateContentConfig(
             system_instruction=self.system_instruction,
             response_mime_type="application/json",
-            response_schema=RobotAction,
+            response_schema=LLMResponse,
             temperature=0.7
         )
 
@@ -60,7 +75,7 @@ class BrainService:
                 )
                 if response.text:
                     return self.parse_action_json(response.text)
-                return FALLBACK_ACTION
+                return DEFAULT_LLM_FALLBACK
 
             except APIError as e:
                 if "503" in str(e) and attempt < settings.MAX_RETRIES:
@@ -69,12 +84,12 @@ class BrainService:
                     continue
                 elif "429" in str(e):
                     print("[BrainService] 429 Quota Exceeded 감지. 안전 탈출합니다.")
-                    return FALLBACK_ACTION
+                    return DEFAULT_LLM_FALLBACK
                 else:
                     print(f"[BrainService] API 오류 발생: {e}")
-                    return FALLBACK_ACTION
+                    return DEFAULT_LLM_FALLBACK
             except Exception as e:
                 print(f"[BrainService] 예상치 못한 통신 오류: {e}")
-                return FALLBACK_ACTION
+                return DEFAULT_LLM_FALLBACK
 
-        return FALLBACK_ACTION
+        return DEFAULT_LLM_FALLBACK
