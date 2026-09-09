@@ -1,17 +1,23 @@
 import queue
 import threading
 import time
-from typing import Any, List, Tuple
+import logging
+from typing import Any, List, Tuple, Optional, Union
+import numpy as np
 
 from server.repositories.log_repository import insert_interaction_log
 from server.repositories.preset_repository import load_emotion_presets, get_preset_for_emotion
-from server.schemas.action import RobotAction, LLMResponse, FALLBACK_ACTION
-from server.services.brain_service import BrainService
+from server.schemas.action import RobotAction, LLMResponse, TriggerType
+from server.services.brain_service import BrainService, brain_service
+from server.services.stt_service import stt_service
+from server.services.intent_service import intent_service
+
+logger = logging.getLogger(__name__)
 
 
 class AIWorker:
-    def __init__(self, brain_service: BrainService):
-        self.brain_service = brain_service
+    def __init__(self, brain_service_instance: BrainService = brain_service):
+        self.brain_service = brain_service_instance
         self.request_queue: queue.Queue[Tuple[str, str, List[Any], float]] = queue.Queue(maxsize=1)
         self.response_queue: queue.Queue[Tuple[RobotAction, str, float]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -19,7 +25,6 @@ class AIWorker:
 
     def start(self) -> None:
         """백그라운드 데몬 스레드 구동 및 DB 프리셋 캐싱"""
-        # 서버 시작 시 DB에서 감정 프리셋(RGB, duration)을 메모리에 1회 적재
         load_emotion_presets()
 
         self.stop_event.clear()
@@ -95,3 +100,78 @@ class AIWorker:
             # 4. 메인 스레드로 완성된 RobotAction 전달
             self.response_queue.put((action, trigger_type, latency))
             self.request_queue.task_done()
+
+    def process_voice_interaction(
+        self, 
+        audio_data: Union[np.ndarray, bytes], 
+        current_frame: Optional[bytes] = None
+    ) -> Optional[RobotAction]:
+        total_start = time.time()
+
+        # 1. STT 변환 시간 측정
+        t0 = time.time()
+        user_text = stt_service.transcribe(audio_data)
+        stt_latency = time.time() - t0
+
+        if not user_text:
+            print("[AIWorker] 인식된 텍스트가 없습니다.")
+            return None
+
+        # 2. 의도 판별 시간 측정
+        t1 = time.time()
+        trigger_str, needs_vision = intent_service.analyze_voice_intent(user_text)
+        intent_latency = time.time() - t1
+
+        # 3. Payload 조립
+        contents = []
+        if needs_vision and current_frame is not None:
+            contents.append({
+                "mime_type": "image/jpeg",
+                "data": current_frame
+            })
+            prompt_text = f"사용자의 말: \"{user_text}\""
+        else:
+            prompt_text = f"사용자의 음성 대화: \"{user_text}\""
+        contents.append(prompt_text)
+
+        # 4. Gemini 추론 시간 측정
+        t2 = time.time()
+        llm_response: LLMResponse = self.brain_service.infer_action(contents)
+        gemini_latency = time.time() - t2
+
+        total_latency = time.time() - total_start
+
+        # 구간별 레이턴시 출력
+        print(f"\n[⏱️ 속도 분석] 총 소요: {total_latency:.2f}s | STT: {stt_latency:.2f}s | Intent: {intent_latency*1000:.1f}ms | Gemini: {gemini_latency:.2f}s")
+
+        # 5. Emotion 매핑 및 RobotAction 조립
+        emotion_key = (
+            llm_response.emotion.value 
+            if hasattr(llm_response.emotion, "value") 
+            else str(llm_response.emotion)
+        )
+        preset = get_preset_for_emotion(emotion_key)
+
+        action = RobotAction(
+            emotion=llm_response.emotion,
+            speech=llm_response.speech,
+            led_rgb=preset["rgb"],
+            duration=preset["duration"]
+        )
+
+        # 6. DB 로깅 (비동기 처리 권장)
+        try:
+            insert_interaction_log(
+                trigger_type=trigger_str,
+                prompt=prompt_text,
+                action=action,
+                latency_seconds=total_latency
+            )
+        except Exception as e:
+            print(f"[AIWorker DB Warning] 로그 적재 실패: {e}")
+
+        return action
+
+
+# Spring Bean 스타일 전역 싱글톤 등록
+ai_worker = AIWorker()
