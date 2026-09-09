@@ -20,10 +20,10 @@ class STTService:
 
     def __init__(
         self,
-        model_size: str = "small",
+        model_size: str = "base",
         device: str = "cpu",
         compute_type: str = "int8",
-        cpu_threads: int = 4
+        cpu_threads: int = 6
     ):
         logger.info(
             f"Initializing Faster-Whisper: model={model_size}, device={device}, "
@@ -58,7 +58,8 @@ class STTService:
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
                 initial_prompt=prompt_text,
-                beam_size=5,
+                beam_size=1,                        # 5 -> 1 로 변경 (속도 대폭 향상)
+                best_of=1,                          #단일 추론 고정
                 temperature=0.0,                    # 가장 정확한 토큰만 선택 (오타 방지)
                 condition_on_previous_text=False,   # 이전 문맥 왜곡 방지
                 no_speech_threshold=0.6,
