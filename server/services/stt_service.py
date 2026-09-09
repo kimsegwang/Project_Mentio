@@ -12,6 +12,12 @@ logger = logging.getLogger(__name__)
 
 
 class STTService:
+    # 모델에 사전 주입할 고유명사 및 도메인 컨텍스트
+    DOMAIN_INITIAL_PROMPT = (
+        "안녕 멘티오, 멘티오야 오늘 날씨 어때? 주변 한번 봐봐. "
+        "사진 찍어줘. 반가워, 지금 뭐 하고 있어? 반려로봇 대화."
+    )
+
     def __init__(
         self,
         model_size: str = "small",
@@ -19,10 +25,6 @@ class STTService:
         compute_type: str = "int8",
         cpu_threads: int = 4
     ):
-        """
-        Spring의 @PostConstruct 역할: 모델을 메모리에 1회 싱글톤 로드합니다.
-        Ryzen 7 5700U 최적화: CPU INT8 양자화 및 4스레드 할당.
-        """
         logger.info(
             f"Initializing Faster-Whisper: model={model_size}, device={device}, "
             f"compute_type={compute_type}, threads={cpu_threads}"
@@ -39,32 +41,28 @@ class STTService:
     def transcribe(
         self, 
         audio_input: Union[np.ndarray, bytes, str],
-        initial_prompt: str = "멘티오, 탁상형 반려로봇과의 대화."
+        initial_prompt: str = None
     ) -> str:
         """
         오디오 입력을 받아 한국어 텍스트로 변환합니다.
-
-        Args:
-            audio_input: 
-                - np.ndarray: 16kHz float32 1D numpy array
-                - bytes: WAV/PCM 파일 바이너리 버퍼
-                - str: 로컬 오디오 파일 경로
-            initial_prompt: 고유명사 및 도메인 인식 힌트
-            
-        Returns:
-            str: 변환된 문자열 (공백 정리 완료)
         """
         try:
             if isinstance(audio_input, bytes):
                 audio_input = io.BytesIO(audio_input)
+
+            prompt_text = initial_prompt if initial_prompt else self.DOMAIN_INITIAL_PROMPT
 
             segments, info = self.model.transcribe(
                 audio_input,
                 language="ko",
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
-                initial_prompt=initial_prompt,
-                beam_size=5
+                initial_prompt=prompt_text,
+                beam_size=5,
+                temperature=0.0,                    # 가장 정확한 토큰만 선택 (오타 방지)
+                condition_on_previous_text=False,   # 이전 문맥 왜곡 방지
+                no_speech_threshold=0.6,
+                repetition_penalty=1.1              # 끝자리 반복 억제
             )
 
             transcribed_text = " ".join([segment.text.strip() for segment in segments]).strip()

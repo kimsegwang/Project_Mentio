@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import logging
 from typing import Optional, List, Any
 from google import genai
 from google.genai import types
@@ -8,6 +9,8 @@ from google.genai.errors import APIError
 
 from config import settings
 from server.schemas.action import LLMResponse, EmotionType
+
+logger = logging.getLogger(__name__)
 
 # LLM 레벨 파싱 실패 시 기본 Fallback 응답
 DEFAULT_LLM_FALLBACK = LLMResponse(
@@ -53,7 +56,7 @@ class BrainService:
                 return LLMResponse.model_validate_json(json_match.group(0))
             return LLMResponse.model_validate_json(cleaned)
         except Exception as e:
-            print(f"[BrainService Error] JSON 파싱 실패: {e} -> Fallback 반환")
+            logger.error(f"[BrainService Error] JSON 파싱 실패: {e} -> Fallback 반환")
             return DEFAULT_LLM_FALLBACK
 
     def infer_action(self, contents: List[Any]) -> LLMResponse:
@@ -79,17 +82,47 @@ class BrainService:
 
             except APIError as e:
                 if "503" in str(e) and attempt < settings.MAX_RETRIES:
-                    print(f"[BrainService] 503 과부하 감지. 1초 대기 후 재시도 ({attempt + 1}/{settings.MAX_RETRIES})...")
+                    logger.warning(f"[BrainService] 503 과부하 감지. 1초 대기 후 재시도 ({attempt + 1}/{settings.MAX_RETRIES})...")
                     time.sleep(1.0)
                     continue
                 elif "429" in str(e):
-                    print("[BrainService] 429 Quota Exceeded 감지. 안전 탈출합니다.")
+                    logger.warning("[BrainService] 429 Quota Exceeded 감지. 안전 탈출합니다.")
                     return DEFAULT_LLM_FALLBACK
                 else:
-                    print(f"[BrainService] API 오류 발생: {e}")
+                    logger.error(f"[BrainService] API 오류 발생: {e}")
                     return DEFAULT_LLM_FALLBACK
             except Exception as e:
-                print(f"[BrainService] 예상치 못한 통신 오류: {e}")
+                logger.error(f"[BrainService] 예상치 못한 통신 오류: {e}")
                 return DEFAULT_LLM_FALLBACK
 
         return DEFAULT_LLM_FALLBACK
+
+    def classify_vision_intent(self, text: str) -> bool:
+        """
+        텍스트 문맥을 분석하여 눈앞의 시각 정보(카메라 스냅샷)가 필요한지 판별합니다.
+        (Tier 2 Semantic Routing)
+        """
+        prompt = (
+            "당신은 탁상형 반려로봇의 의도 분석기입니다. "
+            "사용자의 발화 문맥을 보고, 로봇이 '지금 눈앞의 사물/사람/주변 환경을 카메라로 직접 보아야 하는 상황'인지 판단하세요.\n\n"
+            "판단 기준:\n"
+            "- 로봇에게 눈앞의 무언가를 보거나, 사진을 찍거나, 표정/옷/사물을 확인해달라고 하면: YES\n"
+            "- 과거의 일, 단순 지식 질문, 일반 일상 대화, 보지 않아도 대답할 수 있으면: NO\n\n"
+            f"사용자 발화: \"{text}\"\n"
+            "답변: (YES 또는 NO만 한 단어로 출력)"
+        )
+        try:
+            client = self.get_client()
+            response = client.models.generate_content(
+                model=settings.GEMINI_MODEL_NAME,
+                contents=prompt
+            )
+            result = response.text.strip().upper()
+            return "YES" in result
+        except Exception as e:
+            logger.error(f"Failed to classify vision intent with LLM: {e}")
+            return False
+
+
+# Spring Bean 싱글톤 인스턴스 생성 (외부 import용)
+brain_service = BrainService()
