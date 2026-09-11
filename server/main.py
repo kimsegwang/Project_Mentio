@@ -15,15 +15,32 @@ from server.services.vision_service import VisionService
 from server.services.audio_listener_service import audio_listener_service
 from server.workers.ai_worker import AIWorker
 
-# 전역 공유 상태
+# 전역 공유 상태 (스레드 동기화용)
 latest_frame = None
 frame_lock = threading.Lock()
 stop_event = threading.Event()
 flash_trigger_time = 0.0
 
+# 🚀 1. 전역 상태 플래그 및 동기화 락 선언
+is_processing = False
+processing_lock = threading.Lock()
+
+
+def handle_voice_interaction_thread(ai_worker: AIWorker, audio_data, pil_snapshot):
+    """
+    음성 처리 스레드 실행 래퍼:
+    처리가 시작될 때 is_processing을 켜고, 완료 시 안전하게 복구(try...finally)
+    """
+    global is_processing
+    try:
+        ai_worker.process_voice_interaction(audio_data, pil_snapshot)
+    finally:
+        with processing_lock:
+            is_processing = False
+
 
 def audio_listener_worker(ai_worker: AIWorker, vision_service: VisionService):
-    global flash_trigger_time
+    global flash_trigger_time, is_processing
     print("[AudioWorker] 음성 감지 리스너 스레드 시작.")
     
     while not stop_event.is_set():
@@ -33,7 +50,15 @@ def audio_listener_worker(ai_worker: AIWorker, vision_service: VisionService):
             break
 
         if audio_data is not None:
-            # 📸 발화 종료 감지 즉시 화면 플래시 트리거 발동
+            # 🚀 2. Busy-Dropping: 시스템이 이미 제스처/음성/스냅샷을 처리 중이면 음성 입력 무시
+            with processing_lock:
+                if is_processing:
+                    print("\n⚠️ [Busy-Dropping] 로봇이 이미 생각/동작 중입니다. 방금 들어온 음성을 폐기합니다.")
+                    continue
+                # 처리 시작 상태로 전환 (상호 배제 획득)
+                is_processing = True
+
+            # 📸 발화 감지 통과 시 화면 플래시 트리거 발동
             flash_trigger_time = time.time()
             print("\n📸 [찰칵!] 발화 종료 감지 -> 현재 웹캠 프레임 캡처 완료!")
 
@@ -42,9 +67,10 @@ def audio_listener_worker(ai_worker: AIWorker, vision_service: VisionService):
                 if latest_frame is not None:
                     pil_snapshot = vision_service.prepare_snapshot_for_vlm(latest_frame)
 
+            # 🚀 3. 상태 해제가 보장된 래퍼 함수를 스레드로 실행
             threading.Thread(
-                target=ai_worker.process_voice_interaction,
-                args=(audio_data, pil_snapshot),
+                target=handle_voice_interaction_thread,
+                args=(ai_worker, audio_data, pil_snapshot),
                 daemon=True
             ).start()
 
@@ -52,7 +78,7 @@ def audio_listener_worker(ai_worker: AIWorker, vision_service: VisionService):
 
 
 def run_mentio_engine():
-    global latest_frame
+    global latest_frame, is_processing
 
     print("=" * 65)
     print(" Project Sentio (Mentio) - Integrated Multimodal Engine")
@@ -92,7 +118,6 @@ def run_mentio_engine():
         speech="시스템이 정상 가동 중입니다.",
         led_rgb=[0, 150, 255]
     )
-    is_processing = False
     status_msg = ""
     last_event_time = 0.0
 
@@ -117,59 +142,58 @@ def run_mentio_engine():
             # B. 실시간 비전 처리 (30fps 무중단 제스처 감지)
             frame, is_heart = vision_service.process_gesture(frame)
 
-            # C. 제스처 트리거 검사
-            if is_heart and not is_processing and (current_time - last_event_time > settings.COOLDOWN_SECONDS):
-                last_event_time = current_time
-                is_processing = True
-                status_msg = "Analyzing Heart Gesture..."
-                prompt = "사용자가 양손으로 하트 제스처를 보냈습니다. 기쁨과 감사의 애정 표현을 담아 다정하게 반응하세요."
-                ai_worker.submit_task("GESTURE", prompt, [prompt])
+            # C. 제스처 트리거 검사 (🚀 4. 동기화된 is_processing 플래그 활용)
+            if is_heart and (current_time - last_event_time > settings.COOLDOWN_SECONDS):
+                with processing_lock:
+                    if not is_processing:
+                        is_processing = True
+                        last_event_time = current_time
+                        status_msg = "Analyzing Heart Gesture..."
+                        prompt = "사용자가 양손으로 하트 제스처를 보냈습니다. 기쁨과 감사의 애정 표현을 담아 다정하게 반응하세요."
+                        ai_worker.submit_task("GESTURE", prompt, [prompt])
 
             # D. 키보드 인터럽트 처리
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('s') and not is_processing:
-                if current_time - last_event_time > settings.COOLDOWN_SECONDS:
-                    last_event_time = current_time
-                    is_processing = True
-                    status_msg = "Analyzing Snapshot VLM..."
+            elif key == ord('s') and (current_time - last_event_time > settings.COOLDOWN_SECONDS):
+                with processing_lock:
+                    if not is_processing:
+                        is_processing = True
+                        last_event_time = current_time
+                        status_msg = "Analyzing Snapshot VLM..."
 
-                    pil_img = vision_service.prepare_snapshot_for_vlm(frame)
-                    prompt = "로봇 정면 카메라에 포착된 사용자와 주변 상황을 보고 1~2문장의 다정한 친구 말투로 요약해줘."
-                    ai_worker.submit_task("SNAPSHOT", prompt, [pil_img, prompt])
+                        pil_img = vision_service.prepare_snapshot_for_vlm(frame)
+                        prompt = "로봇 정면 카메라에 포착된 사용자와 주변 상황을 보고 1~2문장의 다정한 친구 말투로 요약해줘."
+                        ai_worker.submit_task("SNAPSHOT", prompt, [pil_img, prompt])
 
-            # E. 백그라운드 워커 결과 논블로킹 폴링
+            # E. 백그라운드 워커 결과 논블로킹 폴링 (제스처 및 스냅샷 결과 반영)
             result = ai_worker.poll_result()
             if result is not None:
                 action, trigger_type, latency = result
                 current_action = action
-                is_processing = False
+                with processing_lock:
+                    is_processing = False
                 status_msg = ""
                 print(f"[Engine] 액션 반영 완료: [{current_action.emotion}] \"{current_action.speech}\"")
 
             # F. UI 오버레이 렌더링
-            if is_processing:
-                cv2.rectangle(frame, (10, 10), (450, 45), (0, 140, 255), -1)
-                cv2.putText(frame, f"[AI Thinking] {status_msg}", (20, 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
             h_frame, w_frame, _ = frame.shape
             cv2.rectangle(frame, (0, h_frame - 60), (w_frame, h_frame), (30, 30, 30), -1)
 
-            # 📸 캡처 순간 0.3초 동안 화면 테두리 플래시 및 텍스트 팝업
+            # 📸 캡처 순간 0.35초 동안 화면 플래시 효과
             if time.time() - flash_trigger_time < 0.35:
-                # 화면 전체에 옅은 흰색 플래시 효과
                 white_overlay = frame.copy()
                 white_overlay[:] = (255, 255, 255)
                 frame = cv2.addWeighted(frame, 0.6, white_overlay, 0.4, 0)
-                # 찰칵 안내 텍스트
                 cv2.putText(frame, "SNAPSHOT CAPTURED!", (w_frame // 2 - 160, h_frame // 2),
                             cv2.FONT_HERSHEY_DUPLEX, 0.9, (0, 0, 255), 2)
 
+            # 생각 중 UI 오버레이
             if is_processing:
+                display_msg = status_msg if status_msg else "Processing Voice/AI..."
                 cv2.rectangle(frame, (10, 10), (450, 45), (0, 140, 255), -1)
-                cv2.putText(frame, f"[AI Thinking] {status_msg}", (20, 35),
+                cv2.putText(frame, f"[AI Thinking] {display_msg}", (20, 35),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
             # LED 인디케이터 시각화
