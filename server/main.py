@@ -3,6 +3,7 @@ import sys
 import time
 import threading
 import cv2
+import pygame
 
 # 프로젝트 루트 경로 등록
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,6 +15,7 @@ from server.services.brain_service import BrainService
 from server.services.vision_service import VisionService
 from server.services.audio_listener_service import audio_listener_service
 from server.workers.ai_worker import AIWorker
+from server.repositories.preset_repository import get_preset_for_emotion
 
 # 전역 공유 상태 (스레드 동기화용)
 latest_frame = None
@@ -24,6 +26,12 @@ flash_trigger_time = 0.0
 # 🚀 1. 전역 상태 플래그 및 동기화 락 선언
 is_processing = False
 processing_lock = threading.Lock()
+
+def release_processing_lock():
+    """워커의 발화 및 에코 쿨다운 종료 시 안전하게 호출되는 전역 락 해제 함수"""
+    global is_processing
+    with processing_lock:
+        is_processing = False
 
 
 def handle_voice_interaction_thread(ai_worker: AIWorker, audio_data, pil_snapshot):
@@ -90,7 +98,10 @@ def run_mentio_engine():
     # 2. 서비스 및 워커 레이어 인스턴스화
     vision_service = VisionService()
     brain_service = BrainService()
-    ai_worker = AIWorker(brain_service_instance=brain_service)
+    ai_worker = AIWorker(
+        brain_service_instance=brain_service,
+        on_task_completed=release_processing_lock  # 💡 락 해제 콜백 전달
+    )
     ai_worker.start()
 
     # 3. 비전 카메라 스트림 오픈
@@ -113,11 +124,16 @@ def run_mentio_engine():
     window_name = "Mentio Robot Engine (30fps Vision & Async AI)"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
-    current_action = RobotAction(
+    # 💡 [개선] DB 프리셋 캐시에서 NEUTRAL 기본값을 동적으로 로드 (하드코딩 제거)
+    neutral_preset = get_preset_for_emotion("NEUTRAL")
+    DEFAULT_ACTION = RobotAction(
         emotion="NEUTRAL",
         speech="시스템이 정상 가동 중입니다.",
-        led_rgb=[0, 150, 255]
+        led_rgb=neutral_preset["rgb"],
+        duration=neutral_preset["duration"]
     )
+    current_action = DEFAULT_ACTION
+    action_set_time = 0.0  # 💡 액션 적용 시점 기록용 타임스탬프
     status_msg = ""
     last_event_time = 0.0
 
@@ -142,7 +158,7 @@ def run_mentio_engine():
             # B. 실시간 비전 처리 (30fps 무중단 제스처 감지)
             frame, is_heart = vision_service.process_gesture(frame)
 
-            # C. 제스처 트리거 검사 (🚀 4. 동기화된 is_processing 플래그 활용)
+            # C. 제스처 트리거 검사
             if is_heart and (current_time - last_event_time > settings.COOLDOWN_SECONDS):
                 with processing_lock:
                     if not is_processing:
@@ -167,15 +183,34 @@ def run_mentio_engine():
                         prompt = "로봇 정면 카메라에 포착된 사용자와 주변 상황을 보고 1~2문장의 다정한 친구 말투로 요약해줘."
                         ai_worker.submit_task("SNAPSHOT", prompt, [pil_img, prompt])
 
-            # E. 백그라운드 워커 결과 논블로킹 폴링 (제스처 및 스냅샷 결과 반영)
+            # E. 백그라운드 워커 결과 논블로킹 폴링 (제스처, 스냅샷, 음성 대화 결과 통합 반영)
             result = ai_worker.poll_result()
             if result is not None:
                 action, trigger_type, latency = result
                 current_action = action
-                with processing_lock:
-                    is_processing = False
+                action_set_time = time.time()  # 액션 시작 시각 기록
                 status_msg = ""
-                print(f"[Engine] 액션 반영 완료: [{current_action.emotion}] \"{current_action.speech}\"")
+                print(f"[Engine] 액션 반영 완료: [{current_action.emotion}] \"{current_action.speech}\" (지속시간: {current_action.duration}s)")
+                # 💡 여기서 is_processing을 직접 풀지 않음 (워커의 finally가 전담 해제)
+
+            # 감정 지속 시간(duration) 초과 시 기본 상태(NEUTRAL)로 자동 복귀
+            current_emotion_str = (
+                current_action.emotion.value 
+                if hasattr(current_action.emotion, "value") 
+                else str(current_action.emotion)
+            )
+            with processing_lock:
+                is_busy = is_processing
+
+            if current_emotion_str != "NEUTRAL":
+                # 로봇이 말하는 동안에는 기준 시각을 계속 뒤로 미룸 (말 끝난 후 카운트 시작)
+                if is_busy:
+                    action_set_time = current_time
+                else:
+                    action_duration = getattr(current_action, "duration", 5.0) or 5.0
+                    if current_time - action_set_time > action_duration:
+                        current_action = DEFAULT_ACTION
+                        print(f"[Engine] 감정 지속 시간({action_duration}s) 만료 -> NEUTRAL 상태로 자동 복귀")
 
             # F. UI 오버레이 렌더링
             h_frame, w_frame, _ = frame.shape

@@ -23,10 +23,12 @@ class AIWorker:
         brain_service_instance: BrainService = brain_service,
         tts_service_instance: Optional[TTSService] = None,
         audio_player_instance: Optional[AudioPlayerService] = None,
+        on_task_completed: Optional[callable] = None, # 💡 콜백 주입받기
     ):
         self.brain_service = brain_service_instance
         self.tts_service = tts_service_instance or TTSService()
         self.audio_player = audio_player_instance or AudioPlayerService()
+        self.on_task_completed = on_task_completed
 
         self.request_queue: queue.Queue[Tuple[str, str, List[Any], float]] = queue.Queue(maxsize=1)
         self.response_queue: queue.Queue[Tuple[RobotAction, str, float]] = queue.Queue()
@@ -90,44 +92,52 @@ class AIWorker:
             trigger_type, prompt_text, contents, req_time = task
             print(f"[AIWorker] '{trigger_type}' 추론 시작 (Background Thread)...")
 
-            # 1. Gemini VLM 경량 추론
-            llm_response: LLMResponse = self.brain_service.infer_action(contents)
-            latency = time.time() - req_time
-
-            # 2. DB 프리셋 캐시에서 RGB 및 duration 매핑 -> RobotAction 조립
-            emotion_key = (
-                llm_response.emotion.value 
-                if hasattr(llm_response.emotion, "value") 
-                else str(llm_response.emotion)
-            )
-            preset = get_preset_for_emotion(emotion_key)
-
-            action = RobotAction(
-                emotion=llm_response.emotion,
-                speech=llm_response.speech,
-                led_rgb=preset["rgb"],
-                duration=preset["duration"]
-            )
-            print(f"[AIWorker] '{trigger_type}' 매핑 완료 ({latency:.2f}s) -> Action: {emotion_key}, LED: {action.led_rgb}")
-
-            # 3. PostgreSQL DB에 비동기 로그 적재
             try:
-                insert_interaction_log(
-                    trigger_type=trigger_type,
-                    prompt=prompt_text,
-                    action=action,
-                    latency_seconds=latency
+                # 1. Gemini VLM 추론
+                llm_response: LLMResponse = self.brain_service.infer_action(contents)
+                latency = time.time() - req_time
+
+                # 2. DB 프리셋 조립
+                emotion_key = (
+                    llm_response.emotion.value 
+                    if hasattr(llm_response.emotion, "value") 
+                    else str(llm_response.emotion)
                 )
+                preset = get_preset_for_emotion(emotion_key)
+
+                action = RobotAction(
+                    emotion=llm_response.emotion,
+                    speech=llm_response.speech,
+                    led_rgb=preset["rgb"],
+                    duration=preset["duration"]
+                )
+                print(f"[AIWorker] '{trigger_type}' 매핑 완료 ({latency:.2f}s) -> Action: {emotion_key}, LED: {action.led_rgb}")
+
+                # 3. DB 비동기 로깅
+                try:
+                    insert_interaction_log(
+                        trigger_type=trigger_type,
+                        prompt=prompt_text,
+                        action=action,
+                        latency_seconds=latency
+                    )
+                except Exception as e:
+                    print(f"[AIWorker DB Warning] 로그 적재 실패: {e}")
+
+                # 4. 메인 UI로 먼저 전달 -> 표정/LED 즉시 변경 (0초 체감)
+                self.response_queue.put((action, trigger_type, latency))
+
+                # 5. 스피커 음성 합성 및 에코 잔향 대기
+                if action.speech:
+                    self._play_speech_and_guard(action.speech)
+
             except Exception as e:
-                print(f"[AIWorker DB Warning] 로그 적재 중 예외 발생: {e}")
-
-            # 4. 제스처/스냅샷 반응 TTS 출력 (재생 완료 시까지 대기하여 에코 방어)
-            if action.speech:
-                self._play_speech_and_guard(action.speech)
-
-            # 5. 메인 스레드로 완성된 RobotAction 전달 (재생 완료 후 전달)
-            self.response_queue.put((action, trigger_type, latency))
-            self.request_queue.task_done()
+                print(f"[AIWorker Error] 작업 처리 중 예외 발생: {e}")
+            finally:
+                # 💡 [개선] 순환 import 없이 주입받은 콜백으로 안전하게 락 해제
+                if self.on_task_completed:
+                    self.on_task_completed()
+                self.request_queue.task_done()
 
     def process_voice_interaction(
         self, 
