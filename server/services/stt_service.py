@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 class STTService:
     # 모델에 사전 주입할 고유명사 및 도메인 컨텍스트
     DOMAIN_INITIAL_PROMPT = (
-        "안녕 멘티오, 멘티오야 오늘 날씨 어때? 주변 한번 봐봐. "
-        "사진 찍어줘. 반가워, 지금 뭐 하고 있어? 반려로봇 대화."
+        "안녕 멘티오, 멘티오야? 오늘 날씨 어때? 몇 시야? "
+        "이거 뭐야? 주변 한번 봐봐. 사진 찍어줘. 반가워, 지금 뭐해? "
+        "고마워, 잘했어. 반려로봇 멘티오와의 일상 대화."
     )
 
     def __init__(
@@ -56,10 +57,10 @@ class STTService:
                 audio_input,
                 language="ko",
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
+                vad_parameters=dict(min_silence_duration_ms=400),
                 initial_prompt=prompt_text,
-                beam_size=1,                        # 5 -> 1 로 변경 (속도 대폭 향상)
-                best_of=1,                          #단일 추론 고정
+                beam_size=1,                        
+                best_of=1,                          # 단일 추론 고정
                 temperature=0.0,                    # 가장 정확한 토큰만 선택 (오타 방지)
                 condition_on_previous_text=False,   # 이전 문맥 왜곡 방지
                 no_speech_threshold=0.6,
