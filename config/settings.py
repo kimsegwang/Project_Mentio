@@ -28,3 +28,9 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 # 커넥션 풀 설정
 DB_POOL_MIN_CONN = 1
 DB_POOL_MAX_CONN = 5
+
+# TTS & Audio Settings
+TTS_VOICE_NAME = "ko-KR-SunHiNeural"
+TTS_RATE = "+0%"
+TTS_PITCH = "+0Hz"
+AUDIO_REVERB_GUARD_SEC = 0.4

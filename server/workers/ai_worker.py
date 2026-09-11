@@ -11,13 +11,23 @@ from server.schemas.action import RobotAction, LLMResponse, TriggerType
 from server.services.brain_service import BrainService, brain_service
 from server.services.stt_service import stt_service
 from server.services.intent_service import intent_service
+from server.services.tts_service import TTSService
+from server.services.audio_player_service import AudioPlayerService
 
 logger = logging.getLogger(__name__)
 
 
 class AIWorker:
-    def __init__(self, brain_service_instance: BrainService = brain_service):
+    def __init__(
+        self,
+        brain_service_instance: BrainService = brain_service,
+        tts_service_instance: Optional[TTSService] = None,
+        audio_player_instance: Optional[AudioPlayerService] = None,
+    ):
         self.brain_service = brain_service_instance
+        self.tts_service = tts_service_instance or TTSService()
+        self.audio_player = audio_player_instance or AudioPlayerService()
+
         self.request_queue: queue.Queue[Tuple[str, str, List[Any], float]] = queue.Queue(maxsize=1)
         self.response_queue: queue.Queue[Tuple[RobotAction, str, float]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -56,6 +66,20 @@ class AIWorker:
         except queue.Empty:
             return None
 
+    def _play_speech_and_guard(self, speech_text: str) -> None:
+        """공통 음성 합성 및 에코 캔슬링 블로킹 재생"""
+        if not speech_text or not speech_text.strip():
+            return
+        
+        try:
+            print(f"🔊 [TTS 발화 시작] \"{speech_text}\"")
+            audio_bytes = self.tts_service.synthesize(speech_text)
+            if audio_bytes:
+                self.audio_player.play_bytes_and_wait(audio_bytes)
+                print("🔊 [TTS 발화 및 에코 잔향 가드 종료]")
+        except Exception as e:
+            print(f"[AIWorker TTS Warning] 음성 재생 실패: {e}")
+
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -66,7 +90,7 @@ class AIWorker:
             trigger_type, prompt_text, contents, req_time = task
             print(f"[AIWorker] '{trigger_type}' 추론 시작 (Background Thread)...")
 
-            # 1. Gemini VLM 경량 추론 (LLMResponse: emotion + speech)
+            # 1. Gemini VLM 경량 추론
             llm_response: LLMResponse = self.brain_service.infer_action(contents)
             latency = time.time() - req_time
 
@@ -97,7 +121,11 @@ class AIWorker:
             except Exception as e:
                 print(f"[AIWorker DB Warning] 로그 적재 중 예외 발생: {e}")
 
-            # 4. 메인 스레드로 완성된 RobotAction 전달
+            # 4. 제스처/스냅샷 반응 TTS 출력 (재생 완료 시까지 대기하여 에코 방어)
+            if action.speech:
+                self._play_speech_and_guard(action.speech)
+
+            # 5. 메인 스레드로 완성된 RobotAction 전달 (재생 완료 후 전달)
             self.response_queue.put((action, trigger_type, latency))
             self.request_queue.task_done()
 
@@ -117,7 +145,6 @@ class AIWorker:
             print("[AIWorker] 인식된 음성 텍스트가 없습니다.")
             return None
 
-        # 🔍 [추가] STT가 인식한 실제 문장 출력
         print(f"\n🎤 [STT 인식 결과] \"{user_text}\" (소요: {stt_latency:.2f}s)")
 
         # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION)
@@ -128,12 +155,10 @@ class AIWorker:
         # 3. Contents Payload 조립
         contents = []
         if needs_vision and current_frame is not None:
-            # 📸 [보강] 비전 모드: 캡처된 사진을 LLM에 전송
             contents.append(current_frame)
             prompt_text = f"사용자의 시각 기반 질문: \"{user_text}\""
             print(f"📸 [Vision Pipeline] 시각 동봉 결정 (Type: {trigger_str}) -> 480p 스냅샷을 Gemini로 전송합니다.")
         else:
-            # 💬 [보강] 텍스트 모드: 사진을 버리고 텍스트만 전송
             prompt_text = f"사용자의 음성 대화: \"{user_text}\""
             print(f"💬 [Text Pipeline] 순수 텍스트 결정 (Type: {trigger_str}) -> 사진 제외, 텍스트만 전송합니다.")
 
@@ -145,8 +170,6 @@ class AIWorker:
         gemini_latency = time.time() - t2
 
         total_latency = time.time() - total_start
-
-        # 구간별 레이턴시 출력
         print(f"[⏱️ 속도 분석] 총 소요: {total_latency:.2f}s | STT: {stt_latency:.2f}s | Intent: {intent_latency*1000:.1f}ms | Gemini: {gemini_latency:.2f}s")
 
         # 5. Emotion 매핑 및 RobotAction 조립
@@ -175,7 +198,13 @@ class AIWorker:
         except Exception as e:
             print(f"[AIWorker DB Warning] 로그 적재 실패: {e}")
 
+        # 7. UI 반영을 위해 큐에 결과 즉각 전달
         self.response_queue.put((action, trigger_str, total_latency))
+
+        # 8. [핵심 에코 방어] 음성 출력 완료 시점까지 handle_voice_interaction_thread를 블로킹
+        #    이 작업이 끝나야 main.py의 finally 블록에서 is_processing = False가 호출됩니다.
+        if action.speech:
+            self._play_speech_and_guard(action.speech)
 
         return action
 
