@@ -104,37 +104,42 @@ class AIWorker:
     def process_voice_interaction(
         self, 
         audio_data: Union[np.ndarray, bytes], 
-        current_frame: Optional[bytes] = None
+        current_frame: Optional[Any] = None
     ) -> Optional[RobotAction]:
         total_start = time.time()
 
-        # 1. STT 변환 시간 측정
+        # 1. STT 변환
         t0 = time.time()
         user_text = stt_service.transcribe(audio_data)
         stt_latency = time.time() - t0
 
-        if not user_text:
-            print("[AIWorker] 인식된 텍스트가 없습니다.")
+        if not user_text or not user_text.strip():
+            print("[AIWorker] 인식된 음성 텍스트가 없습니다.")
             return None
 
-        # 2. 의도 판별 시간 측정
+        # 🔍 [추가] STT가 인식한 실제 문장 출력
+        print(f"\n🎤 [STT 인식 결과] \"{user_text}\" (소요: {stt_latency:.2f}s)")
+
+        # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION)
         t1 = time.time()
         trigger_str, needs_vision = intent_service.analyze_voice_intent(user_text)
         intent_latency = time.time() - t1
 
-        # 3. Payload 조립
+        # 3. Contents Payload 조립
         contents = []
         if needs_vision and current_frame is not None:
-            contents.append({
-                "mime_type": "image/jpeg",
-                "data": current_frame
-            })
-            prompt_text = f"사용자의 말: \"{user_text}\""
+            # 📸 [보강] 비전 모드: 캡처된 사진을 LLM에 전송
+            contents.append(current_frame)
+            prompt_text = f"사용자의 시각 기반 질문: \"{user_text}\""
+            print(f"📸 [Vision Pipeline] 시각 동봉 결정 (Type: {trigger_str}) -> 480p 스냅샷을 Gemini로 전송합니다.")
         else:
+            # 💬 [보강] 텍스트 모드: 사진을 버리고 텍스트만 전송
             prompt_text = f"사용자의 음성 대화: \"{user_text}\""
+            print(f"💬 [Text Pipeline] 순수 텍스트 결정 (Type: {trigger_str}) -> 사진 제외, 텍스트만 전송합니다.")
+
         contents.append(prompt_text)
 
-        # 4. Gemini 추론 시간 측정
+        # 4. Gemini 추론
         t2 = time.time()
         llm_response: LLMResponse = self.brain_service.infer_action(contents)
         gemini_latency = time.time() - t2
@@ -142,7 +147,7 @@ class AIWorker:
         total_latency = time.time() - total_start
 
         # 구간별 레이턴시 출력
-        print(f"\n[⏱️ 속도 분석] 총 소요: {total_latency:.2f}s | STT: {stt_latency:.2f}s | Intent: {intent_latency*1000:.1f}ms | Gemini: {gemini_latency:.2f}s")
+        print(f"[⏱️ 속도 분석] 총 소요: {total_latency:.2f}s | STT: {stt_latency:.2f}s | Intent: {intent_latency*1000:.1f}ms | Gemini: {gemini_latency:.2f}s")
 
         # 5. Emotion 매핑 및 RobotAction 조립
         emotion_key = (
@@ -159,7 +164,7 @@ class AIWorker:
             duration=preset["duration"]
         )
 
-        # 6. DB 로깅 (비동기 처리 권장)
+        # 6. DB 로깅
         try:
             insert_interaction_log(
                 trigger_type=trigger_str,
@@ -169,6 +174,8 @@ class AIWorker:
             )
         except Exception as e:
             print(f"[AIWorker DB Warning] 로그 적재 실패: {e}")
+
+        self.response_queue.put((action, trigger_str, total_latency))
 
         return action
 
