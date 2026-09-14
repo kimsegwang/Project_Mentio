@@ -88,12 +88,14 @@ class BrainService:
     def infer_action(self, contents: List[Any]) -> LLMResponse:
         client = self.get_client()
 
-        # types 객체 충돌 없이 순수 JSON 강제 + 1024 토큰 설정
+        # ⚡ 400 에러 방어: thinking_budget=0 대신 정식 지원 옵션 적용
+        # (SDK 버전에 따라 thinking_budget을 지원하지 않거나 0을 거부하는 현상 차단)
         config = types.GenerateContentConfig(
             system_instruction=self.system_instruction,
             response_mime_type="application/json",
             temperature=0.2,
-            max_output_tokens=1024
+            max_output_tokens=1024,
+            thinking_config=types.ThinkingConfig(thinking_budget=1) # 0 대신 최소 단위인 1 지정
         )
 
         for attempt in range(settings.MAX_RETRIES + 1):
