@@ -34,3 +34,9 @@ TTS_VOICE_NAME = "ko-KR-SunHiNeural"
 TTS_RATE = "+0%"
 TTS_PITCH = "+0Hz"
 AUDIO_REVERB_GUARD_SEC = 0.4
+
+# --- RAG 장기 기억(Long-term Memory) 설정 ---
+DEFAULT_USER_ID = "primary_user"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # 384차원, FastEmbed(ONNX) 로컬 추론
+EMBEDDING_DIM = 384
+RAG_TOP_K = 2  # 프롬프트 주입 시 유사도 상위 문장 개수 상한
