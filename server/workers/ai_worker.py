@@ -100,7 +100,12 @@ class AIWorker:
             return ""
 
         if not memories:
+            print(f"🧠 [RAG] 임계값({settings.RAG_SIMILARITY_THRESHOLD}) 이상의 관련 기억 없음, 컨텍스트 주입 생략")
             return ""
+
+        for memory in memories:
+            score = f"{memory.similarity:.2f}" if memory.similarity is not None else "N/A"
+            print(f"🧠 [RAG] [참고 기억] {memory.fact_text} (유사도: {score})")
 
         return "\n".join(f"[참고 기억] {memory.fact_text}" for memory in memories)
 

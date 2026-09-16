@@ -31,12 +31,14 @@ def search_similar_memories(
     embedding: EmbeddingVector,
     user_id: str = settings.DEFAULT_USER_ID,
     top_k: int = settings.RAG_TOP_K,
+    threshold: float = settings.RAG_SIMILARITY_THRESHOLD,
 ) -> List[MemoryRecord]:
-    """쿼리 임베딩과 코사인 유사도가 가장 높은 상위 top_k개의 장기 기억을 조회한다."""
+    """쿼리 임베딩과 코사인 유사도가 threshold 이상인 기억 중 상위 top_k개를 조회한다."""
     query = """
         SELECT id, user_id, fact_text, created_at, 1 - (embedding <=> %s::vector) AS similarity
         FROM user_long_term_memory
         WHERE user_id = %s
+          AND 1 - (embedding <=> %s::vector) >= %s
         ORDER BY embedding <=> %s::vector
         LIMIT %s;
     """
@@ -44,7 +46,7 @@ def search_similar_memories(
         with get_db_connection() as conn:
             register_vector(conn)
             with conn.cursor() as cursor:
-                cursor.execute(query, (embedding, user_id, embedding, top_k))
+                cursor.execute(query, (embedding, user_id, embedding, threshold, embedding, top_k))
                 rows = cursor.fetchall()
                 return [
                     MemoryRecord(

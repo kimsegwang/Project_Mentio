@@ -76,6 +76,36 @@ def test_retrieve_memory_context_returns_empty_when_no_hits(worker, monkeypatch)
     assert worker._retrieve_memory_context("아무 상관 없는 발화") == ""
 
 
+def test_retrieve_memory_context_prints_similarity_score_per_memory(worker, monkeypatch, capsys):
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+    monkeypatch.setattr(
+        ai_worker_module,
+        "search_similar_memories",
+        lambda embedding, top_k: [
+            MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.912345),
+        ],
+    )
+
+    context = worker._retrieve_memory_context("오늘 뭐 마실까?")
+
+    # 실제 Gemini 프롬프트에 주입되는 컨텍스트 문자열 자체는 기존 포맷 그대로 유지
+    assert context == "[참고 기억] 커피를 좋아한다"
+    # 콘솔에 항상 보이도록 print로 유사도 점수가 소수점 둘째 자리까지 함께 찍힌다
+    captured = capsys.readouterr()
+    assert "🧠 [RAG] [참고 기억] 커피를 좋아한다 (유사도: 0.91)" in captured.out
+
+
+def test_retrieve_memory_context_prints_skip_message_when_no_hits(worker, monkeypatch, capsys):
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+    monkeypatch.setattr(ai_worker_module, "search_similar_memories", lambda embedding, top_k: [])
+
+    worker._retrieve_memory_context("아무 상관 없는 발화")
+
+    captured = capsys.readouterr()
+    assert "🧠 [RAG]" in captured.out
+    assert "생략" in captured.out
+
+
 def test_retrieve_memory_context_returns_empty_on_failure_without_raising(worker, monkeypatch):
     def raise_error(text):
         raise RuntimeError("embedding backend down")
