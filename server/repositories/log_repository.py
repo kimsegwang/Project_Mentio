@@ -1,5 +1,9 @@
+import logging
+
 from server.repositories.connection import get_db_connection
 from server.schemas.action import RobotAction
+
+logger = logging.getLogger(__name__)
 
 
 def insert_interaction_log(
@@ -40,6 +44,6 @@ def insert_interaction_log(
                     )
                 )
             conn.commit()
-            print(f"[Database] 로그 적재 완료 (Type: {trigger_type}, Emotion: {emotion_val}, Latency: {latency_ms}ms)")
+            logger.info(f"[LogRepository] 로그 적재 완료 (Type: {trigger_type}, Emotion: {emotion_val}, Latency: {latency_ms}ms)")
     except Exception as e:
-        print(f"[Database Error] 로그 적재 실패: {e}")
+        logger.error(f"[LogRepository Error] 로그 적재 실패: {e}")

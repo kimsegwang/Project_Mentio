@@ -36,6 +36,7 @@ SET r = EXCLUDED.r, g = EXCLUDED.g, b = EXCLUDED.b, duration = EXCLUDED.duration
 CREATE TABLE IF NOT EXISTS interaction_logs (
     id SERIAL PRIMARY KEY,
     trigger_type VARCHAR(50) NOT NULL,
+    prompt TEXT,
     emotion VARCHAR(30) NOT NULL REFERENCES emotion_presets(emotion),
     speech TEXT,
     led_r INT NOT NULL,

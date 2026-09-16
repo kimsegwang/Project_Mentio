@@ -45,5 +45,10 @@ def get_db_connection() -> Generator[psycopg2.extensions.connection, None, None]
     conn = _db_pool.getconn()
     try:
         yield conn
+    except Exception:
+        # 💡 실패한 트랜잭션 상태로 커넥션이 풀에 반납되면, 다음 대여자의 정상 쿼리까지
+        #    InFailedSqlTransaction으로 연쇄 실패시키므로 반드시 롤백 후 반납한다.
+        conn.rollback()
+        raise
     finally:
         _db_pool.putconn(conn)

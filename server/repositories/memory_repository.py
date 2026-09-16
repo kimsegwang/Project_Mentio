@@ -14,7 +14,7 @@ def insert_memory(user_id: str, fact_text: str, embedding: EmbeddingVector) -> N
     """추출된 사실/에피소드 한 건을 장기 기억 저장소에 적재한다 (Background Task 전용)."""
     query = """
         INSERT INTO user_long_term_memory (user_id, fact_text, embedding)
-        VALUES (%s, %s, %s);
+        VALUES (%s, %s, %s::vector);
     """
     try:
         with get_db_connection() as conn:
@@ -34,10 +34,10 @@ def search_similar_memories(
 ) -> List[MemoryRecord]:
     """쿼리 임베딩과 코사인 유사도가 가장 높은 상위 top_k개의 장기 기억을 조회한다."""
     query = """
-        SELECT id, user_id, fact_text, created_at, 1 - (embedding <=> %s) AS similarity
+        SELECT id, user_id, fact_text, created_at, 1 - (embedding <=> %s::vector) AS similarity
         FROM user_long_term_memory
         WHERE user_id = %s
-        ORDER BY embedding <=> %s
+        ORDER BY embedding <=> %s::vector
         LIMIT %s;
     """
     try:
