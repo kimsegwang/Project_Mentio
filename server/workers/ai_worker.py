@@ -157,27 +157,36 @@ class AIWorker:
 
         print(f"\n🎤 [STT 인식 결과] \"{user_text}\" (소요: {stt_latency:.2f}s)")
 
-        # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION)
+        # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION vs VOICE_TIME_RULE)
         t1 = time.time()
         trigger_str, needs_vision = intent_service.analyze_voice_intent(user_text)
         intent_latency = time.time() - t1
 
-        # 3. Contents Payload 조립
-        contents = []
-        if needs_vision and current_frame is not None:
-            contents.append(current_frame)
-            prompt_text = f"사용자의 시각 기반 질문: \"{user_text}\""
-            print(f"📸 [Vision Pipeline] 시각 동봉 결정 (Type: {trigger_str}) -> 480p 스냅샷을 Gemini로 전송합니다.")
+        if trigger_str == TriggerType.VOICE_TIME_RULE.value:
+            # 2-1. [룰 기반 즉시 처리] 시간 질의는 Gemini 호출을 건너뛰고 로컬 시계로 즉답
+            prompt_text = f"[룰 기반 즉시 처리] 시간 질의: \"{user_text}\""
+            print(f"⏰ [Rule-based Instant] 시간 질의 감지 (Type: {trigger_str}) -> LLM 호출 스킵, 로컬 시계로 즉답합니다.")
+
+            t2 = time.time()
+            llm_response: LLMResponse = intent_service.build_time_response()
+            gemini_latency = time.time() - t2
         else:
-            prompt_text = f"사용자의 음성 대화: \"{user_text}\""
-            print(f"💬 [Text Pipeline] 순수 텍스트 결정 (Type: {trigger_str}) -> 사진 제외, 텍스트만 전송합니다.")
+            # 3. Contents Payload 조립
+            contents = []
+            if needs_vision and current_frame is not None:
+                contents.append(current_frame)
+                prompt_text = f"사용자의 시각 기반 질문: \"{user_text}\""
+                print(f"📸 [Vision Pipeline] 시각 동봉 결정 (Type: {trigger_str}) -> 480p 스냅샷을 Gemini로 전송합니다.")
+            else:
+                prompt_text = f"사용자의 음성 대화: \"{user_text}\""
+                print(f"💬 [Text Pipeline] 순수 텍스트 결정 (Type: {trigger_str}) -> 사진 제외, 텍스트만 전송합니다.")
 
-        contents.append(prompt_text)
+            contents.append(prompt_text)
 
-        # 4. Gemini 추론
-        t2 = time.time()
-        llm_response: LLMResponse = self.brain_service.infer_action(contents)
-        gemini_latency = time.time() - t2
+            # 4. Gemini 추론
+            t2 = time.time()
+            llm_response: LLMResponse = self.brain_service.infer_action(contents)
+            gemini_latency = time.time() - t2
 
         total_latency = time.time() - total_start
         print(f"[⏱️ 속도 분석] 총 소요: {total_latency:.2f}s | STT: {stt_latency:.2f}s | Intent: {intent_latency*1000:.1f}ms | Gemini: {gemini_latency:.2f}s")
