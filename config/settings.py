@@ -40,3 +40,8 @@ DEFAULT_USER_ID = "primary_user"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # 384차원, FastEmbed(ONNX) 로컬 추론
 EMBEDDING_DIM = 384
 RAG_TOP_K = 2  # 프롬프트 주입 시 유사도 상위 문장 개수 상한
+RAG_SIMILARITY_THRESHOLD = 0.80  # 이 값(코사인 유사도, 1에 가까울수록 유사) 미만인 기억은 무관한 것으로 간주해 프롬프트 주입에서 제외
+# 실기 테스트 결과 0.65에서는 "안녕", "너 이름이 뭐야?" 같은 단순 인사/일반 질문에도
+# all-MiniLM-L6-v2 임베딩 특유의 이방성으로 무관한 과거 기억이 새어 들어왔고,
+# 0.75에서도 "안녕."(마침표 첫 턴)이 여전히 새고, 0.78에서도 "안녕."이 0.78xx로 턱걸이 통과하는 것이
+# 로그로 확인되어 0.80으로 재상향함. "안녕?"은 0.78 시점에 이미 정상 차단됨을 로그로 확인.
