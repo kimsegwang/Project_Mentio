@@ -5,12 +5,16 @@ import logging
 from typing import Any, List, Tuple, Optional, Union
 import numpy as np
 
+from config import settings
 from server.repositories.log_repository import insert_interaction_log
 from server.repositories.preset_repository import load_emotion_presets, get_preset_for_emotion
+from server.repositories.memory_repository import search_similar_memories
 from server.schemas.action import RobotAction, LLMResponse, TriggerType
 from server.services.brain_service import BrainService, brain_service
 from server.services.stt_service import stt_service
 from server.services.intent_service import intent_service
+from server.services.embedding_service import embedding_service
+from server.services import memory_service
 from server.services.tts_service import TTSService
 from server.services.audio_player_service import AudioPlayerService
 
@@ -81,6 +85,24 @@ class AIWorker:
                 print("🔊 [TTS 발화 및 에코 잔향 가드 종료]")
         except Exception as e:
             print(f"[AIWorker TTS Warning] 음성 재생 실패: {e}")
+
+    def _retrieve_memory_context(self, user_text: str) -> str:
+        """
+        [RAG Retrieval] 사용자 발화를 로컬 임베딩 후 pgvector에서 Top-K 유사 기억을 조회하여
+        "[참고 기억] ..." 형태의 간결한 컨텍스트 문자열로 조립한다.
+        검색 실패 시에도 대화 파이프라인이 끊기지 않도록 빈 문자열을 반환한다.
+        """
+        try:
+            query_embedding = embedding_service.embed(user_text)
+            memories = search_similar_memories(query_embedding, top_k=settings.RAG_TOP_K)
+        except Exception as e:
+            print(f"[AIWorker RAG Warning] 장기 기억 검색 실패: {e}")
+            return ""
+
+        if not memories:
+            return ""
+
+        return "\n".join(f"[참고 기억] {memory.fact_text}" for memory in memories)
 
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -170,9 +192,20 @@ class AIWorker:
             t2 = time.time()
             llm_response: LLMResponse = intent_service.build_time_response()
             gemini_latency = time.time() - t2
+            rag_latency = 0.0
         else:
+            # 2-2. [RAG Retrieval] 시간 룰 질의가 아닐 때만 장기 기억 검색 (Top-K=2)
+            t_rag = time.time()
+            memory_context = self._retrieve_memory_context(user_text)
+            rag_latency = time.time() - t_rag
+            if memory_context:
+                print(f"🧠 [RAG] 장기 기억 컨텍스트 주입 ({rag_latency*1000:.1f}ms):\n{memory_context}")
+
             # 3. Contents Payload 조립
             contents = []
+            if memory_context:
+                contents.append(memory_context)
+
             if needs_vision and current_frame is not None:
                 contents.append(current_frame)
                 prompt_text = f"사용자의 시각 기반 질문: \"{user_text}\""
@@ -189,7 +222,7 @@ class AIWorker:
             gemini_latency = time.time() - t2
 
         total_latency = time.time() - total_start
-        print(f"[⏱️ 속도 분석] 총 소요: {total_latency:.2f}s | STT: {stt_latency:.2f}s | Intent: {intent_latency*1000:.1f}ms | Gemini: {gemini_latency:.2f}s")
+        print(f"[⏱️ 속도 분석] 총 소요: {total_latency:.2f}s | STT: {stt_latency:.2f}s | Intent: {intent_latency*1000:.1f}ms | RAG: {rag_latency*1000:.1f}ms | Gemini: {gemini_latency:.2f}s")
 
         # 5. Emotion 매핑 및 RobotAction 조립
         emotion_key = (
@@ -224,6 +257,14 @@ class AIWorker:
         #    이 작업이 끝나야 main.py의 finally 블록에서 is_processing = False가 호출됩니다.
         if action.speech:
             self._play_speech_and_guard(action.speech)
+
+        # 9. [B-1] TTS 완료 후 규칙 기반 필터링 + 비동기 적재 (대화 지연 영향 0, Fire-and-forget)
+        if trigger_str != TriggerType.VOICE_TIME_RULE.value:
+            threading.Thread(
+                target=memory_service.extract_and_store,
+                args=(user_text,),
+                daemon=True,
+            ).start()
 
         return action
 

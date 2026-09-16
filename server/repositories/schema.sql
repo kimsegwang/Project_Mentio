@@ -1,4 +1,5 @@
 -- 기존 테이블 초기화 (의존성 고려해 역순 삭제)
+-- ⚠️ user_long_term_memory는 장기 기억 유실 방지를 위해 절대 DROP 대상에 포함하지 않는다.
 DROP TABLE IF EXISTS interaction_logs CASCADE;
 DROP TABLE IF EXISTS emotion_presets CASCADE;
 
@@ -44,3 +45,19 @@ CREATE TABLE IF NOT EXISTS interaction_logs (
     latency_ms INT,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 4. 장기 기억(RAG) 저장소
+-- ⚠️ 절대 DROP하지 않는다 (서버 재기동/스키마 재적용 시 사용자 기억 유실 방지).
+--    all-MiniLM-L6-v2 로컬 임베딩 기준 384차원 고정.
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS user_long_term_memory (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL DEFAULT 'primary_user',
+    fact_text TEXT NOT NULL,
+    embedding VECTOR(384) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_memory_embedding
+ON user_long_term_memory USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
