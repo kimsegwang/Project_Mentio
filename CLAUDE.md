@@ -3,7 +3,7 @@
 ## 1. 프로젝트 개요 & 문서 참조
 - **정체성**: Anki Vector / Cozmo 스타일의 피지컬 AI 데스크 반려로봇. 단순한 음성 비서가 아닌, 감정 동기화와 고유 인터랙션을 갖춘 탁상형 감성 메이트를 지향한다.
 - **아키텍처**: 계층형 엣지-클라우드 (ESP32-S3 엔드포인트 + PC 로컬 엣지 게이트웨이 + Gemini 3.6 Flash 클라우드).
-- **상세 명세서**: 전체 기능 스펙, DB 스키마, 하드웨어 핀아웃 매핑의 세부 내용은 `docs/spec_v2.1.md`를 필히 참고할 것.
+- **상세 명세서**: 전체 기능 스펙, DB 스키마, 하드웨어 핀아웃 매핑의 세부 내용은 `docs/system_spec_v2.2.md`를 필히 참고할 것.
 
 ---
 
@@ -17,6 +17,7 @@
   - 설정을 누락하거나 삭제하면 기본 추론 프로세스로 인해 약 1.8초의 불필요한 지연이 추가됨.
 - **출력 토큰 상한**: `max_output_tokens`는 최소 `1024` 이상 유지할 것 (비전 모드에서 한글 멀티바이트 문자열 잘림 방어).
 - **Auto-healing JSON 파서 보존**: 바깥쪽 중괄호 슬라이싱(`find`/`rfind`), 마크다운 코드블록 제거, 닫는 괄호 자동 보정(`..."}`) 로직을 절대 삭제하지 말 것. 단순 `json.loads`나 SDK의 `response_schema`로 교체 금지.
+- **`_extract_json_object()` 공용 헬퍼 보존**: 위 Auto-healing 파싱 로직은 `parse_action_json`(감정/대사 추론)과 `classify_memory_relation`(장기 기억 모순 판정)이 함께 공유하는 단일 헬퍼다. 각 호출부에 파싱 로직을 개별 복제하거나 어느 한쪽만 다른 방식(예: 단순 `json.loads`)으로 교체하지 말 것.
 
 ### 2) IntentService (`server/services/intent_service.py`)
 의도 분석 판별 순서는 반드시 다음 5단계를 엄격히 준수할 것:
@@ -31,6 +32,10 @@
 - **타이머 앵커링**: 표정 복귀 타이머는 발화가 시작될 때가 아니라, **로봇의 스피커 출력이 완전히 끝난 시점부터 카운트다운**하여 DB에 설정된 지속시간(4~5초) 유지 후 `NEUTRAL`로 자동 복귀시킬 것.
 - 서비스 전반에서 의존성 역전 원칙(DIP)과 상호 배제(Mutex) 락 구조를 유지할 것.
 
+### 4) DB 연결 및 정합성 (`server/repositories/connection.py`, `memory_repository.py`)
+- **실패 트랜잭션 롤백 가드**: `get_db_connection()` 컨텍스트 매니저는 내부에서 예외가 발생하면 반드시 `conn.rollback()`을 호출한 뒤 커넥션을 풀에 반납할 것. 롤백 없이 실패 상태 그대로 반납하면 다음 대여자의 정상 쿼리까지 `InFailedSqlTransaction`으로 연쇄 실패한다.
+- **`user_long_term_memory` 테이블 보존**: 서버 재기동/스키마 재적용 시에도 절대 `DROP`하지 말 것. 신규 컬럼 추가는 반드시 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`로만 증분 반영하여 기존 사용자 기억을 유실시키지 않는다.
+
 ---
 
 ## 3. 백엔드 & RAG(장기 기억) 개발 가이드라인
@@ -42,7 +47,14 @@
 ### RAG(장기 기억) 파이프라인 규칙
 - **저지연 로컬 임베딩**: 대화 중 외부 API 호출을 배제하고 로컬 경량 모델(FastEmbed 또는 ONNX 기반 `all-MiniLM-L6-v2` 계열)을 사용하여 벡터 변환 시간을 0.05초 이내로 유지할 것.
 - **비동기 메모리 적재**: 대화에서 기억할 정보 추출 및 `pgvector` 저장은 **반드시 로봇의 음성 응답(TTS)이 완료된 후 Background Task(비동기 워커)**로 처리할 것. 대화 턴 중 DB 저장을 동기로 실행해 지연을 유발하지 말 것.
+  - **순차 적재 큐 필수**: 적재 요청을 위해 `threading.Thread`를 직접 생성하지 말 것. 반드시 `MemoryWriteWorker.submit()`을 통해 단일 소비자 순차 큐에 위임한다. 연속 발화마다 개별 스레드를 띄우면 Invalidation 처리 순서가 실제 발화 순서와 어긋나는 경쟁 상태가 발생한다.
 - **Top-K 제한**: 프롬프트 주입 시 유사도 높은 기억은 최대 2개 문장(`Top-K=2`)으로 제한하여 입력 토큰 증가로 인한 LLM 추론 지연을 원천 방어할 것.
+- **근접 중복 방지 (Dedup)**: 신규 발화 임베딩과 가장 가까운 기존 기억의 유사도가 `RAG_DEDUP_SIMILARITY_THRESHOLD(0.85)` 이상이면 사실상 동일 문장으로 간주해 단순 저장 스킵한다.
+- **모순 해결 (Invalidation)**: 유사도가 `0.55 <= sim < 0.85` 구간인 후보에 한해서만 경량 LLM Reflection(`BrainService.classify_memory_relation`)으로 모순(선호/상태 변경) 여부를 판정한다.
+  - **삽입 선행 원칙**: 신규 기억을 먼저 `INSERT`해 `new_id`를 확보한 뒤, 모순으로 판정된 기존 기억에 `superseded_by=new_id`를 채워야 한다 (순서를 뒤집지 말 것).
+  - **소프트 딜리트 전용**: 모순 판정된 기존 기억은 `is_active=FALSE` + `superseded_by=new_id`로만 무효화한다. 물리 `DELETE`는 절대 금지 (이력 추적/복구 여지 보존).
+- **의문문 검색 최적화**: `QuestionDetector`가 의문형 어미/의문사/회상 질의를 감지하면 해당 조회에 한해서만 `RAG_QUESTION_SIMILARITY_THRESHOLD(0.68)`로 동적 완화한다. LLM 호출 없는 정규식 판별만 사용하여 지연을 추가하지 말 것.
+- **pgvector 파라미터 바인딩**: 임베딩 벡터를 쿼리에 바인딩할 때는 반드시 `%s::vector`로 명시적 캐스팅할 것 (psycopg2 파라미터 타입 추론 오류 방지).
 
 ### 소프트웨어 아키텍처 및 디자인 패턴 (Layered Architecture)
 본 프로젝트는 **계층형 클린 아키텍처(Layered Architecture)**와 **의존성 역전 원칙(DIP)**을 엄격히 따른다. 코드를 작성할 때 각 레이어의 경계를 침범하지 말 것:
