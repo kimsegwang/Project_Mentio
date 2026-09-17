@@ -7,7 +7,9 @@ TTS 완료 후 Background Task에서 임베딩 및 DB 적재를 수행한다.
 import logging
 
 from config import settings
-from server.repositories.memory_repository import insert_memory, search_similar_memories
+from server.repositories.memory_repository import insert_memory, invalidate_memories, search_similar_memories
+from server.schemas.memory import MemoryRelation
+from server.services.brain_service import brain_service
 from server.services.embedding_service import embedding_service
 
 logger = logging.getLogger(__name__)
@@ -46,30 +48,58 @@ def is_memorable(text: str) -> bool:
 
 def extract_and_store(user_text: str, user_id: str = settings.DEFAULT_USER_ID) -> None:
     """
-    TTS 완료 후 Background Task(스레드)에서 호출된다.
-    규칙 기반 필터를 통과한 발화만 로컬 임베딩 후 pgvector에 원문 그대로 적재한다.
+    TTS 완료 후 Background Task(MemoryWriteWorker의 순차 스레드)에서 호출된다.
+    규칙 기반 필터를 통과한 발화만 로컬 임베딩 후:
+      1) 근접 중복(RAG_DEDUP_SIMILARITY_THRESHOLD 이상)이면 저장 스킵
+      2) 주제가 겹치는 후보(RAG_CONFLICT_CANDIDATE_THRESHOLD 이상 ~ Dedup 임계값 미만)가 있으면
+         경량 LLM Reflection(BrainService.classify_memory_relation)으로 모순 여부 판정 후,
+         모순이면 기존 기억을 is_active=FALSE로 무효화하고 신규 사실로 대체
+      3) 그 외에는 그대로 신규 적재
     """
     if not is_memorable(user_text):
         return
 
     try:
         embedding = embedding_service.embed(user_text)
+        fact_text = user_text.strip()
 
-        # 임계값 튜닝 가시성을 위해 threshold=0.0으로 가장 가까운 기존 기억 1건을 무조건 조회한다
-        # (중복 여부 판정은 아래에서 RAG_DEDUP_SIMILARITY_THRESHOLD와 직접 비교).
-        nearest = search_similar_memories(embedding, user_id=user_id, top_k=1, threshold=0.0)
+        # 임계값 튜닝 가시성 + 모순 후보 확보를 한 번의 조회로 처리한다
+        # (threshold=0.0, top_k=RAG_CONFLICT_TOP_K로 가장 가까운 기존 기억들을 무조건 조회).
+        nearest = search_similar_memories(embedding, user_id=user_id, top_k=settings.RAG_CONFLICT_TOP_K, threshold=0.0)
+        top_match = nearest[0] if nearest else None
 
-        if nearest and nearest[0].similarity >= settings.RAG_DEDUP_SIMILARITY_THRESHOLD:
+        if top_match and top_match.similarity >= settings.RAG_DEDUP_SIMILARITY_THRESHOLD:
             logger.info(
-                f"🧠 [MemoryService] 중복 기억 감지(유사도: {nearest[0].similarity:.2f}), 저장 스킵: {user_text[:30]}..."
+                f"🧠 [MemoryService] 중복 기억 감지(유사도: {top_match.similarity:.2f}), 저장 스킵: {user_text[:30]}..."
             )
             return
 
-        insert_memory(user_id=user_id, fact_text=user_text.strip(), embedding=embedding)
+        conflict_candidates = [
+            m for m in nearest
+            if settings.RAG_CONFLICT_CANDIDATE_THRESHOLD <= (m.similarity or 0.0) < settings.RAG_DEDUP_SIMILARITY_THRESHOLD
+        ]
 
-        if nearest:
+        if conflict_candidates:
+            relation_result = brain_service.classify_memory_relation(fact_text, conflict_candidates)
+        else:
+            relation_result = None
+
+        new_id = insert_memory(user_id=user_id, fact_text=fact_text, embedding=embedding)
+
+        if relation_result is not None and relation_result.relation == MemoryRelation.CONTRADICTS:
+            # LLM이 후보 목록 밖의 id를 언급(환각)하는 경우를 방어하기 위해 후보 id로 한 번 더 검증한다.
+            candidate_ids = {m.id for m in conflict_candidates}
+            ids_to_invalidate = [i for i in relation_result.conflicting_ids if i in candidate_ids]
+            if ids_to_invalidate:
+                invalidate_memories(ids_to_invalidate, superseded_by=new_id)
+                logger.info(
+                    f"🧠 [MemoryService] 모순 감지, 기존 기억 {ids_to_invalidate}건 비활성화 "
+                    f"-> 신규 기억(id={new_id})으로 대체: {user_text[:30]}..."
+                )
+
+        if top_match:
             logger.info(
-                f"🧠 [MemoryService] 신규 기억 적재 (최고 유사도: {nearest[0].similarity:.2f} < "
+                f"🧠 [MemoryService] 신규 기억 적재 (최고 유사도: {top_match.similarity:.2f} < "
                 f"{settings.RAG_DEDUP_SIMILARITY_THRESHOLD}): {user_text[:30]}..."
             )
         else:

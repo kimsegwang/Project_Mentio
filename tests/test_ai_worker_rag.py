@@ -132,17 +132,17 @@ def test_time_rule_skips_rag_retrieval_and_background_storage(worker, monkeypatc
 
     search_mock = Mock()
     embed_mock = Mock()
-    extract_and_store_mock = Mock()
+    submit_mock = Mock()
     monkeypatch.setattr(ai_worker_module, "search_similar_memories", search_mock)
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", embed_mock)
-    monkeypatch.setattr(ai_worker_module.memory_service, "extract_and_store", extract_and_store_mock)
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", submit_mock)
 
     action = worker.process_voice_interaction(audio_data=b"dummy")
 
     assert action.speech == "지금은 오후 3시야!"
     search_mock.assert_not_called()
     embed_mock.assert_not_called()
-    extract_and_store_mock.assert_not_called()
+    submit_mock.assert_not_called()
 
 
 def test_voice_chat_injects_memory_context_into_gemini_contents(worker, monkeypatch):
@@ -174,25 +174,26 @@ def test_voice_chat_triggers_background_storage_after_tts(worker, monkeypatch):
     )
     monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text: "")
 
-    extract_and_store_mock = Mock()
-    monkeypatch.setattr(ai_worker_module.memory_service, "extract_and_store", extract_and_store_mock)
+    submit_mock = Mock()
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", submit_mock)
 
     worker.process_voice_interaction(audio_data=b"dummy")
 
-    # ImmediateThread 덕분에 fire-and-forget 스레드가 동기적으로 실행되어 즉시 검증 가능
-    extract_and_store_mock.assert_called_once_with("내 이름은 김세강이야")
+    # MemoryWriteWorker의 순차 큐에 위임(submit)만 하고 즉시 반환되므로 대화 턴에는 지연이 없다.
+    # 실제 extract_and_store 실행은 MemoryWriteWorker 자체의 단위 테스트에서 검증한다.
+    submit_mock.assert_called_once_with("내 이름은 김세강이야")
 
 
 def test_no_recognized_text_does_not_touch_rag_pipeline(worker, monkeypatch):
     monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "")
 
     search_mock = Mock()
-    extract_and_store_mock = Mock()
+    submit_mock = Mock()
     monkeypatch.setattr(ai_worker_module, "search_similar_memories", search_mock)
-    monkeypatch.setattr(ai_worker_module.memory_service, "extract_and_store", extract_and_store_mock)
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", submit_mock)
 
     result = worker.process_voice_interaction(audio_data=b"dummy")
 
     assert result is None
     search_mock.assert_not_called()
-    extract_and_store_mock.assert_not_called()
+    submit_mock.assert_not_called()
