@@ -7,10 +7,19 @@ TTS 완료 후 Background Task에서 임베딩 및 DB 적재를 수행한다.
 import logging
 
 from config import settings
-from server.repositories.memory_repository import insert_memory
+from server.repositories.memory_repository import insert_memory, search_similar_memories
 from server.services.embedding_service import embedding_service
 
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    # 루트 로거에 핸들러/레벨이 구성되어 있지 않으면(기본 WARNING) INFO 로그가
+    # 콘솔에 전혀 출력되지 않으므로, 중복 판별 로그의 실시간 가시성 확보를 위해
+    # 이 모듈 전용 콘솔 핸들러를 직접 구성한다.
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_console_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 # 개인 정보/취향/일정성 발화를 식별하기 위한 주요 키워드
 MEMORABLE_KEYWORDS = [
@@ -45,6 +54,25 @@ def extract_and_store(user_text: str, user_id: str = settings.DEFAULT_USER_ID) -
 
     try:
         embedding = embedding_service.embed(user_text)
+
+        # 임계값 튜닝 가시성을 위해 threshold=0.0으로 가장 가까운 기존 기억 1건을 무조건 조회한다
+        # (중복 여부 판정은 아래에서 RAG_DEDUP_SIMILARITY_THRESHOLD와 직접 비교).
+        nearest = search_similar_memories(embedding, user_id=user_id, top_k=1, threshold=0.0)
+
+        if nearest and nearest[0].similarity >= settings.RAG_DEDUP_SIMILARITY_THRESHOLD:
+            logger.info(
+                f"🧠 [MemoryService] 중복 기억 감지(유사도: {nearest[0].similarity:.2f}), 저장 스킵: {user_text[:30]}..."
+            )
+            return
+
         insert_memory(user_id=user_id, fact_text=user_text.strip(), embedding=embedding)
+
+        if nearest:
+            logger.info(
+                f"🧠 [MemoryService] 신규 기억 적재 (최고 유사도: {nearest[0].similarity:.2f} < "
+                f"{settings.RAG_DEDUP_SIMILARITY_THRESHOLD}): {user_text[:30]}..."
+            )
+        else:
+            logger.info(f"🧠 [MemoryService] 신규 기억 적재: {user_text[:30]}...")
     except Exception as e:
         logger.warning(f"[MemoryService] 장기 기억 비동기 적재 실패: {e}")

@@ -1,14 +1,18 @@
 """
 tests/test_memory_service.py
-RAG 백그라운드 적재(B-1: 규칙 기반 필터링) 로직을 검증하는 pytest 단위 테스트.
+RAG 백그라운드 적재(B-1: 규칙 기반 필터링) 및 저장 전 근접 중복 방지(Deduplication) 로직을
+검증하는 pytest 단위 테스트.
 
 CLAUDE.md/설계 결정 검증 대상:
 - Gemini 재호출 없이 키워드/길이 휴리스틱만으로 "기억할 가치" 판별
-- 필터 통과 시에만 로컬 임베딩 -> pgvector 적재 순서로 호출
+- 필터 통과 시에만 로컬 임베딩 -> 근접 중복 검사 -> pgvector 적재 순서로 호출
+- 근접 중복(RAG_DEDUP_SIMILARITY_THRESHOLD 이상) 발견 시 insert 없이 단순 스킵
 - DB/임베딩 예외 발생 시에도 대화 파이프라인에 영향 없이 예외를 삼킴(swallow)
 """
 import pytest
 
+from config import settings
+from server.schemas.memory import MemoryRecord
 from server.services import memory_service
 
 
@@ -75,6 +79,7 @@ def test_extract_and_store_calls_embed_and_insert_when_memorable(monkeypatch):
         "embed",
         lambda text: (embed_calls.append(text), dummy_vector)[1],
     )
+    monkeypatch.setattr(memory_service, "search_similar_memories", lambda *args, **kwargs: [])
     monkeypatch.setattr(memory_service, "insert_memory", lambda **kwargs: insert_calls.append(kwargs))
 
     memory_service.extract_and_store("내 이름은 김세강이야", user_id="primary_user")
@@ -92,6 +97,7 @@ def test_extract_and_store_swallows_embedding_exception(monkeypatch):
 
     insert_calls = []
     monkeypatch.setattr(memory_service.embedding_service, "embed", raise_error)
+    monkeypatch.setattr(memory_service, "search_similar_memories", lambda *args, **kwargs: [])
     monkeypatch.setattr(memory_service, "insert_memory", lambda **kwargs: insert_calls.append(kwargs))
 
     # 예외가 상위로 전파되지 않아야 한다 (대화 파이프라인에 영향 없음)
@@ -102,6 +108,7 @@ def test_extract_and_store_swallows_embedding_exception(monkeypatch):
 
 def test_extract_and_store_swallows_insert_exception(monkeypatch):
     monkeypatch.setattr(memory_service.embedding_service, "embed", lambda text: [0.0] * 384)
+    monkeypatch.setattr(memory_service, "search_similar_memories", lambda *args, **kwargs: [])
 
     def raise_error(**kwargs):
         raise RuntimeError("db down")
@@ -110,3 +117,61 @@ def test_extract_and_store_swallows_insert_exception(monkeypatch):
 
     # insert_memory가 실패해도 예외가 상위로 전파되면 안 된다
     memory_service.extract_and_store("내 이름은 김세강이야")
+
+
+# --- extract_and_store(): 저장 전 근접 중복(Deduplication) 검사 ---
+
+def test_extract_and_store_skips_insert_when_duplicate_found(monkeypatch):
+    dummy_vector = [0.2] * 384
+    existing = MemoryRecord(
+        id=1, user_id="primary_user", fact_text="나는 커피를 정말 좋아해", similarity=0.97, created_at=None
+    )
+    insert_calls = []
+    monkeypatch.setattr(memory_service.embedding_service, "embed", lambda text: dummy_vector)
+    monkeypatch.setattr(memory_service, "search_similar_memories", lambda *args, **kwargs: [existing])
+    monkeypatch.setattr(memory_service, "insert_memory", lambda **kwargs: insert_calls.append(kwargs))
+
+    memory_service.extract_and_store("나는 커피를 정말 좋아해", user_id="primary_user")
+
+    assert insert_calls == []
+
+
+def test_extract_and_store_fetches_nearest_neighbor_unconditionally(monkeypatch):
+    """임계값 튜닝 가시성을 위해 threshold=0.0/top_k=1로 가장 가까운 기억 1건을 항상 조회해야 한다."""
+    dummy_vector = [0.3] * 384
+    search_calls = []
+    monkeypatch.setattr(memory_service.embedding_service, "embed", lambda text: dummy_vector)
+
+    def fake_search(embedding, **kwargs):
+        search_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(memory_service, "search_similar_memories", fake_search)
+    monkeypatch.setattr(memory_service, "insert_memory", lambda **kwargs: None)
+
+    memory_service.extract_and_store("나는 커피를 정말 좋아해", user_id="primary_user")
+
+    assert len(search_calls) == 1
+    assert search_calls[0]["user_id"] == "primary_user"
+    assert search_calls[0]["top_k"] == 1
+    assert search_calls[0]["threshold"] == 0.0
+
+
+def test_extract_and_store_inserts_when_similarity_below_dedup_threshold(monkeypatch):
+    """중복 판정 자체는 서비스 계층에서 RAG_DEDUP_SIMILARITY_THRESHOLD와 직접 비교해야 한다."""
+    dummy_vector = [0.4] * 384
+    near_miss = MemoryRecord(
+        id=2,
+        user_id="primary_user",
+        fact_text="커피 좋아해",
+        similarity=settings.RAG_DEDUP_SIMILARITY_THRESHOLD - 0.01,
+        created_at=None,
+    )
+    insert_calls = []
+    monkeypatch.setattr(memory_service.embedding_service, "embed", lambda text: dummy_vector)
+    monkeypatch.setattr(memory_service, "search_similar_memories", lambda *args, **kwargs: [near_miss])
+    monkeypatch.setattr(memory_service, "insert_memory", lambda **kwargs: insert_calls.append(kwargs))
+
+    memory_service.extract_and_store("나는 커피를 정말 좋아해", user_id="primary_user")
+
+    assert len(insert_calls) == 1
