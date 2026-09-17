@@ -14,6 +14,7 @@ from server.services.brain_service import BrainService, brain_service
 from server.services.stt_service import stt_service
 from server.services.intent_service import intent_service
 from server.services.embedding_service import embedding_service
+from server.services.question_detector import question_detector
 from server.workers.memory_write_worker import memory_write_worker
 from server.services.tts_service import TTSService
 from server.services.audio_player_service import AudioPlayerService
@@ -94,13 +95,23 @@ class AIWorker:
         """
         try:
             query_embedding = embedding_service.embed(user_text)
-            memories = search_similar_memories(query_embedding, top_k=settings.RAG_TOP_K)
+
+            is_question = question_detector.is_question(user_text)
+            threshold = (
+                settings.RAG_QUESTION_SIMILARITY_THRESHOLD
+                if is_question
+                else settings.RAG_SIMILARITY_THRESHOLD
+            )
+            if is_question:
+                print(f"🧠 [RAG] 의문문 감지 -> 완화된 임계값({threshold}) 적용")
+
+            memories = search_similar_memories(query_embedding, top_k=settings.RAG_TOP_K, threshold=threshold)
         except Exception as e:
             print(f"[AIWorker RAG Warning] 장기 기억 검색 실패: {e}")
             return ""
 
         if not memories:
-            print(f"🧠 [RAG] 임계값({settings.RAG_SIMILARITY_THRESHOLD}) 이상의 관련 기억 없음, 컨텍스트 주입 생략")
+            print(f"🧠 [RAG] 임계값({threshold}) 이상의 관련 기억 없음, 컨텍스트 주입 생략")
             return ""
 
         for memory in memories:
