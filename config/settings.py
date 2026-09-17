@@ -55,3 +55,12 @@ RAG_DEDUP_SIMILARITY_THRESHOLD = 0.85  # 저장 전 근접 중복(Deduplication)
 #     조사 생략("고양이 좋아해") 등 0.88 미만 케이스는 중복 저장되는 것이 확인되어, 조사/어미
 #     변형을 흡수하도록 0.85로 재하향함. 단, STT 오인식("다 구양이 좋아해", 0.78)처럼 문자 자체가
 #     달라지는 경우는 0.85로도 흡수되지 않는 별개 문제이며, 이번 조정의 해결 대상이 아니다.
+
+# --- RAG 장기 기억 모순 해결(Invalidation) 설정 ---
+RAG_CONFLICT_CANDIDATE_THRESHOLD = 0.55  # 이 값 이상 RAG_DEDUP_SIMILARITY_THRESHOLD 미만인 기존 기억만
+# "모순 후보"로 간주해 경량 LLM Reflection(BrainService.classify_memory_relation)에 전달한다.
+# 순수 임베딩 유사도만으로는 "사과 좋아해"/"사과 싫어해"처럼 주제는 같고 극성만 반대인 문장을
+# 구분하지 못하므로(오히려 유사도가 높게 나옴), 완전 무관(< 0.55)한 기억까지 매번 LLM에 태우지
+# 않도록 후보 구간만 좁혀 호출 비용을 최소화한다. 초기값이며, Dedup 임계값과 동일하게 실기 로그
+# 기반 반복 튜닝이 필요할 수 있다.
+RAG_CONFLICT_TOP_K = 3  # 모순 판정 LLM 호출 시 전달할 후보 기억 개수 상한.

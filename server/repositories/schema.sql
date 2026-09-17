@@ -62,3 +62,14 @@ CREATE TABLE IF NOT EXISTS user_long_term_memory (
 
 CREATE INDEX IF NOT EXISTS idx_user_memory_embedding
 ON user_long_term_memory USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+-- 5. 장기 기억 모순 해결(Invalidation) 지원 컬럼
+-- ⚠️ 기존 행을 DELETE하지 않고 is_active 플래그로만 비활성화한다 (기억 유실 방지, 이력 조회/복구 여지 보존).
+--    CREATE TABLE IF NOT EXISTS로는 이미 존재하는 테이블에 컬럼이 추가되지 않으므로 ALTER TABLE로 별도 반영.
+ALTER TABLE user_long_term_memory
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS superseded_by BIGINT REFERENCES user_long_term_memory(id),
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
+
+CREATE INDEX IF NOT EXISTS idx_user_memory_active
+ON user_long_term_memory (user_id) WHERE is_active = TRUE;

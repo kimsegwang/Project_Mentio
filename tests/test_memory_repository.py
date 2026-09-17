@@ -20,8 +20,9 @@ from server.schemas.memory import MemoryRecord
 
 
 class FakeCursor:
-    def __init__(self, rows):
-        self._rows = rows
+    def __init__(self, rows=None, returning_id=None):
+        self._rows = rows or []
+        self._returning_id = returning_id
         self.executed_query = None
         self.executed_params = None
 
@@ -38,17 +39,24 @@ class FakeCursor:
     def fetchall(self):
         return self._rows
 
+    def fetchone(self):
+        return (self._returning_id,)
+
 
 class FakeConnection:
-    def __init__(self, rows):
-        self.fake_cursor = FakeCursor(rows)
+    def __init__(self, rows=None, returning_id=None):
+        self.fake_cursor = FakeCursor(rows=rows, returning_id=returning_id)
+        self.committed = False
 
     def cursor(self):
         return self.fake_cursor
 
+    def commit(self):
+        self.committed = True
 
-def _patch_db(monkeypatch, rows):
-    fake_conn = FakeConnection(rows)
+
+def _patch_db(monkeypatch, rows=None, returning_id=None):
+    fake_conn = FakeConnection(rows=rows, returning_id=returning_id)
 
     @contextmanager
     def fake_get_db_connection():
@@ -117,3 +125,68 @@ def test_search_swallows_db_exception_and_returns_empty_list(monkeypatch):
     result = memory_repository.search_similar_memories([0.1] * 384)
 
     assert result == []
+
+
+def test_search_filters_out_inactive_memories(monkeypatch):
+    """무효화(is_active=FALSE)된 기억은 Dedup 검사/RAG 주입 어느 쪽에도 노출되면 안 된다."""
+    fake_conn = _patch_db(monkeypatch, rows=[])
+
+    memory_repository.search_similar_memories([0.1] * 384, user_id="primary_user")
+
+    query = fake_conn.fake_cursor.executed_query
+    assert "is_active = TRUE" in query
+
+
+# --- insert_memory(): RETURNING id ---
+
+def test_insert_memory_returns_new_id(monkeypatch):
+    fake_conn = _patch_db(monkeypatch, returning_id=42)
+
+    new_id = memory_repository.insert_memory(user_id="primary_user", fact_text="사과를 좋아해", embedding=[0.1] * 384)
+
+    assert new_id == 42
+    assert fake_conn.committed is True
+    assert "RETURNING id" in fake_conn.fake_cursor.executed_query
+
+
+def test_insert_memory_swallows_db_exception_and_returns_none(monkeypatch):
+    def raise_error():
+        raise RuntimeError("db connection failed")
+
+    monkeypatch.setattr(memory_repository, "get_db_connection", raise_error)
+
+    result = memory_repository.insert_memory(user_id="primary_user", fact_text="사과를 좋아해", embedding=[0.1] * 384)
+
+    assert result is None
+
+
+# --- invalidate_memories(): 소프트 삭제(is_active=FALSE) ---
+
+def test_invalidate_memories_updates_is_active_flag_with_superseded_by(monkeypatch):
+    fake_conn = _patch_db(monkeypatch)
+
+    memory_repository.invalidate_memories([1, 2], superseded_by=42)
+
+    query, params = fake_conn.fake_cursor.executed_query, fake_conn.fake_cursor.executed_params
+    assert "is_active = FALSE" in query
+    assert "DELETE" not in query.upper()
+    assert params == (42, [1, 2])
+    assert fake_conn.committed is True
+
+
+def test_invalidate_memories_noop_when_ids_empty(monkeypatch):
+    fake_conn = _patch_db(monkeypatch)
+
+    memory_repository.invalidate_memories([], superseded_by=42)
+
+    assert fake_conn.fake_cursor.executed_query is None
+
+
+def test_invalidate_memories_swallows_db_exception(monkeypatch):
+    def raise_error():
+        raise RuntimeError("db connection failed")
+
+    monkeypatch.setattr(memory_repository, "get_db_connection", raise_error)
+
+    # 예외가 상위로 전파되지 않아야 한다 (대화 파이프라인에 영향 없음)
+    memory_repository.invalidate_memories([1], superseded_by=42)

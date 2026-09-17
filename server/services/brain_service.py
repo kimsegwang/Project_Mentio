@@ -13,6 +13,7 @@ from google.genai.errors import APIError
 
 from config import settings
 from server.schemas.action import LLMResponse, EmotionType
+from server.schemas.memory import MemoryConflictResult, MemoryRecord, MemoryRelation
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,18 @@ class BrainService:
             "반드시 영어 인사말, 생각(Thinking), 마크다운(```) 없이 오직 아래의 순수 단일 JSON 한 줄만 출력하라:\n"
             '{"emotion": "HAPPY", "speech": "안녕! 오늘 하루는 어땠어?"}'
         )
+        # RAG 장기 기억 모순 판정(Invalidation) 전용 system instruction.
+        # infer_action의 감정/대사 추론과는 무관한 별도 목적이므로 프롬프트를 분리한다.
+        self.conflict_system_instruction = (
+            "너는 로봇 Mentio의 장기 기억 저장소를 관리하는 판별기다.\n"
+            "[신규 발화]가 [기존 기억 후보] 목록 중 어느 것과 사실적으로 모순되는지 판단하라.\n"
+            "모순이란 같은 대상에 대한 선호/상태가 이전과 달라진 경우다 (예: '사과 좋아해' -> '사과 싫어해').\n"
+            "단순히 주제가 비슷할 뿐 모순은 아닌 경우(예: '사과 좋아해'와 '포도 좋아해'는 서로 다른 대상이므로 "
+            "모순이 아니다)는 반드시 NEW로 판단하라. 확실하지 않으면 NEW로 판단하라.\n"
+            "반드시 마크다운, 설명 없이 오직 아래의 순수 단일 JSON 한 줄만 출력하라:\n"
+            '{"relation": "CONTRADICTS", "conflicting_ids": [3]}\n'
+            '모순이 없으면: {"relation": "NEW", "conflicting_ids": []}'
+        )
 
     def get_client(self) -> genai.Client:
         if self._client is None:
@@ -51,34 +64,48 @@ class BrainService:
         return self._client
 
     @staticmethod
-    def parse_action_json(raw_text: str) -> LLMResponse:
-        try:
-            if not raw_text or not raw_text.strip():
-                return DEFAULT_LLM_FALLBACK
+    def _extract_json_object(raw_text: str) -> Optional[str]:
+        """
+        모델 원시 출력에서 순수 JSON 객체 문자열만 뽑아낸다.
+        마크다운 코드블록 제거 + 바깥쪽 중괄호 슬라이싱 + 잘린 문자열 자동 괄호 보정을 수행하며,
+        parse_action_json과 classify_memory_relation이 이 로직을 공유한다.
+        중괄호를 찾지 못하면 None을 반환한다 (⚠️ 이 auto-healing 로직 자체는 삭제 금지).
+        """
+        if not raw_text or not raw_text.strip():
+            return None
 
-            text = raw_text.strip()
+        text = raw_text.strip()
 
-            # 마크다운 블록 제거
-            if "```" in text:
-                text = re.sub(r"```(?:json)?", "", text)
-                text = text.replace("```", "").strip()
+        # 마크다운 블록 제거
+        if "```" in text:
+            text = re.sub(r"```(?:json)?", "", text)
+            text = text.replace("```", "").strip()
 
-            start_idx = text.find("{")
+        start_idx = text.find("{")
+        end_idx = text.rfind("}")
+
+        # 💡 [Auto-healing] speech 도중 문장이 잘려서 닫는 괄호가 없을 때 자동 복구
+        if start_idx != -1 and (end_idx == -1 or end_idx <= start_idx):
+            if not text.endswith('"'):
+                text += '..."}'
+            else:
+                text += '}'
             end_idx = text.rfind("}")
 
-            # 💡 [Auto-healing] speech 도중 문장이 잘려서 닫는 괄호가 없을 때 자동 복구
-            if start_idx != -1 and (end_idx == -1 or end_idx <= start_idx):
-                if not text.endswith('"'):
-                    text += '..."}'
-                else:
-                    text += '}'
-                end_idx = text.rfind("}")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            return text[start_idx : end_idx + 1]
 
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                clean_json = text[start_idx : end_idx + 1]
+        return None
+
+    @staticmethod
+    def parse_action_json(raw_text: str) -> LLMResponse:
+        try:
+            clean_json = BrainService._extract_json_object(raw_text)
+            if clean_json is not None:
                 return LLMResponse.model_validate_json(clean_json)
 
-            logger.warning(f"[BrainService] 불완전한 JSON 구조 감지: {text}")
+            if raw_text and raw_text.strip():
+                logger.warning(f"[BrainService] 불완전한 JSON 구조 감지: {raw_text.strip()}")
             return DEFAULT_LLM_FALLBACK
 
         except Exception as e:
@@ -139,6 +166,65 @@ class BrainService:
                 return DEFAULT_LLM_FALLBACK
 
         return DEFAULT_LLM_FALLBACK
+
+    def classify_memory_relation(
+        self, new_fact: str, candidates: List[MemoryRecord]
+    ) -> MemoryConflictResult:
+        """
+        [RAG Invalidation] 저장 전 근접 중복(Dedup) 구간은 아니지만 주제가 겹치는 기존 기억
+        후보들과 신규 발화 사이에 모순(선호/상태 변경)이 있는지 경량 LLM Reflection으로 판정한다.
+        TTS 완료 후 백그라운드 스레드(memory_service.extract_and_store)에서만 호출되므로
+        대화 턴 지연에는 영향이 없다. 후보가 없거나 호출 실패 시에는 기존 기억을 잘못 지우는
+        것보다 안전한 쪽인 NEW(무효화 없음)로 폴백한다.
+        """
+        if not candidates:
+            return MemoryConflictResult(relation=MemoryRelation.NEW, conflicting_ids=[])
+
+        candidate_lines = "\n".join(f'- id={c.id}: "{c.fact_text}"' for c in candidates)
+        prompt = f'[신규 발화]\n"{new_fact}"\n\n[기존 기억 후보]\n{candidate_lines}'
+
+        # ⚡ infer_action과 동일한 사유로 thinking_budget은 0이 아닌 1을 유지한다
+        # (0 주입 시 400 INVALID_ARGUMENT, 미설정 시 기본 추론 프로세스로 인한 지연 발생).
+        config = types.GenerateContentConfig(
+            system_instruction=self.conflict_system_instruction,
+            response_mime_type="application/json",
+            temperature=0.0,
+            max_output_tokens=256,
+            thinking_config=types.ThinkingConfig(thinking_budget=1),
+        )
+
+        try:
+            client = self.get_client()
+            response = client.models.generate_content(
+                model=settings.GEMINI_MODEL_NAME,
+                contents=[prompt],
+                config=config,
+            )
+
+            raw_text = ""
+            try:
+                raw_text = response.text or ""
+            except Exception:
+                pass
+
+            if not raw_text and response.candidates:
+                first_cand = response.candidates[0]
+                if first_cand.content and first_cand.content.parts:
+                    raw_text = "".join(
+                        [p.text for p in first_cand.content.parts if hasattr(p, "text") and p.text]
+                    )
+
+            clean_json = self._extract_json_object(raw_text)
+            if clean_json is None:
+                logger.warning(f"[BrainService] 모순 판정 JSON 구조 불완전, NEW로 폴백: {raw_text[:80]}")
+                return MemoryConflictResult(relation=MemoryRelation.NEW, conflicting_ids=[])
+
+            return MemoryConflictResult.model_validate_json(clean_json)
+
+        except Exception as e:
+            logger.warning(f"[BrainService] 기억 모순 판정 실패, 안전하게 NEW로 폴백: {e}")
+            return MemoryConflictResult(relation=MemoryRelation.NEW, conflicting_ids=[])
+
 
 # Spring Bean 싱글톤 등록
 brain_service = BrainService()

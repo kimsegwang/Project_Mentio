@@ -14,7 +14,7 @@ from server.services.brain_service import BrainService, brain_service
 from server.services.stt_service import stt_service
 from server.services.intent_service import intent_service
 from server.services.embedding_service import embedding_service
-from server.services import memory_service
+from server.workers.memory_write_worker import memory_write_worker
 from server.services.tts_service import TTSService
 from server.services.audio_player_service import AudioPlayerService
 
@@ -263,13 +263,11 @@ class AIWorker:
         if action.speech:
             self._play_speech_and_guard(action.speech)
 
-        # 9. [B-1] TTS 완료 후 규칙 기반 필터링 + 비동기 적재 (대화 지연 영향 0, Fire-and-forget)
+        # 9. [B-1] TTS 완료 후 규칙 기반 필터링 + 비동기 적재 (대화 지연 영향 0)
+        #    MemoryWriteWorker의 순차 큐에 위임해, 연속 발화 시 모순 판정/무효화 순서가
+        #    실제 발화 순서와 뒤바뀌는 경쟁 상태를 방지한다.
         if trigger_str != TriggerType.VOICE_TIME_RULE.value:
-            threading.Thread(
-                target=memory_service.extract_and_store,
-                args=(user_text,),
-                daemon=True,
-            ).start()
+            memory_write_worker.submit(user_text)
 
         return action
 

@@ -15,6 +15,7 @@ from server.services.brain_service import BrainService
 from server.services.vision_service import VisionService
 from server.services.audio_listener_service import audio_listener_service
 from server.workers.ai_worker import AIWorker
+from server.workers.memory_write_worker import memory_write_worker
 from server.repositories.preset_repository import get_preset_for_emotion
 
 # 전역 공유 상태 (스레드 동기화용)
@@ -103,12 +104,14 @@ def run_mentio_engine():
         on_task_completed=release_processing_lock  # 💡 락 해제 콜백 전달
     )
     ai_worker.start()
+    memory_write_worker.start()
 
     # 3. 비전 카메라 스트림 오픈
     cap = cv2.VideoCapture(settings.CAMERA_INDEX)
     if not cap.isOpened():
         print(f"[Engine Error] 카메라(Index: {settings.CAMERA_INDEX})를 열 수 없습니다.")
         ai_worker.stop()
+        memory_write_worker.stop()
         close_db_pool()
         return
 
@@ -251,6 +254,7 @@ def run_mentio_engine():
         cap.release()
         cv2.destroyAllWindows()
         ai_worker.stop()
+        memory_write_worker.stop()
         close_db_pool()
         print("[Shutdown] 모든 리소스(카메라, 스레드, 워커, DB 커넥션)가 안전하게 해제되었습니다.")
 
