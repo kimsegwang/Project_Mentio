@@ -58,7 +58,7 @@ def test_retrieve_memory_context_formats_topk_as_reference_lines(worker, monkeyp
     monkeypatch.setattr(
         ai_worker_module,
         "search_similar_memories",
-        lambda embedding, top_k: [
+        lambda embedding, top_k, threshold: [
             MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
             MemoryRecord(id=2, user_id="primary_user", fact_text="매일 아침 산책한다", similarity=0.8),
         ],
@@ -71,7 +71,9 @@ def test_retrieve_memory_context_formats_topk_as_reference_lines(worker, monkeyp
 
 def test_retrieve_memory_context_returns_empty_when_no_hits(worker, monkeypatch):
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
-    monkeypatch.setattr(ai_worker_module, "search_similar_memories", lambda embedding, top_k: [])
+    monkeypatch.setattr(
+        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+    )
 
     assert worker._retrieve_memory_context("아무 상관 없는 발화") == ""
 
@@ -81,7 +83,7 @@ def test_retrieve_memory_context_prints_similarity_score_per_memory(worker, monk
     monkeypatch.setattr(
         ai_worker_module,
         "search_similar_memories",
-        lambda embedding, top_k: [
+        lambda embedding, top_k, threshold: [
             MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.912345),
         ],
     )
@@ -97,13 +99,62 @@ def test_retrieve_memory_context_prints_similarity_score_per_memory(worker, monk
 
 def test_retrieve_memory_context_prints_skip_message_when_no_hits(worker, monkeypatch, capsys):
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
-    monkeypatch.setattr(ai_worker_module, "search_similar_memories", lambda embedding, top_k: [])
+    monkeypatch.setattr(
+        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+    )
 
     worker._retrieve_memory_context("아무 상관 없는 발화")
 
     captured = capsys.readouterr()
     assert "🧠 [RAG]" in captured.out
     assert "생략" in captured.out
+
+
+# --- 의문문 감지 시 동적 임계값(RAG_QUESTION_SIMILARITY_THRESHOLD) 적용 ---
+
+def test_retrieve_memory_context_uses_relaxed_threshold_for_question(worker, monkeypatch):
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+
+    captured_kwargs = {}
+
+    def fake_search(embedding, top_k, threshold):
+        captured_kwargs["threshold"] = threshold
+        return []
+
+    monkeypatch.setattr(ai_worker_module, "search_similar_memories", fake_search)
+
+    worker._retrieve_memory_context("내가 무슨 과일 좋아한다고 했지?")
+
+    assert captured_kwargs["threshold"] == ai_worker_module.settings.RAG_QUESTION_SIMILARITY_THRESHOLD
+
+
+def test_retrieve_memory_context_uses_default_threshold_for_statement(worker, monkeypatch):
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+
+    captured_kwargs = {}
+
+    def fake_search(embedding, top_k, threshold):
+        captured_kwargs["threshold"] = threshold
+        return []
+
+    monkeypatch.setattr(ai_worker_module, "search_similar_memories", fake_search)
+
+    worker._retrieve_memory_context("난 포도 좋아")
+
+    assert captured_kwargs["threshold"] == ai_worker_module.settings.RAG_SIMILARITY_THRESHOLD
+
+
+def test_retrieve_memory_context_logs_relaxed_threshold_for_question(worker, monkeypatch, capsys):
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+    monkeypatch.setattr(
+        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+    )
+
+    worker._retrieve_memory_context("내가 무슨 과일 좋아한다고 했지?")
+
+    captured = capsys.readouterr()
+    assert "의문문 감지" in captured.out
+    assert str(ai_worker_module.settings.RAG_QUESTION_SIMILARITY_THRESHOLD) in captured.out
 
 
 def test_retrieve_memory_context_returns_empty_on_failure_without_raising(worker, monkeypatch):
