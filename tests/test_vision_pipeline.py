@@ -25,7 +25,7 @@ PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 sys.path.append(PROJECT_ROOT)
 sys.path.append(CURRENT_DIR)
 
-from config.settings import settings
+from config import settings
 
 try:
     from test_gesture import HeartDetector

@@ -12,7 +12,7 @@ from google import genai
 from google.genai import types
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.settings import settings
+from config import settings
 
 
 class RobotAction(BaseModel):
@@ -29,7 +29,7 @@ class RobotAction(BaseModel):
     )
 
 
-def test_gemini_brain(prompt: str):
+def run_gemini_brain_demo(prompt: str):
     if not settings.GEMINI_API_KEY:
         print("[오류] .env 파일에 GEMINI_API_KEY가 설정되지 않았습니다.")
         return
@@ -66,4 +66,4 @@ def test_gemini_brain(prompt: str):
 
 
 if __name__ == "__main__":
-    test_gemini_brain("안녕 멘티오! 오늘 기분이 어때?")
+    run_gemini_brain_demo("안녕 멘티오! 오늘 기분이 어때?")
