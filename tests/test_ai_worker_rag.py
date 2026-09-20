@@ -15,7 +15,7 @@ import pytest
 
 import server.workers.ai_worker as ai_worker_module
 from server.schemas.action import EmotionType, LLMResponse, TriggerType
-from server.schemas.memory import MemoryRecord
+from server.schemas.memory import MemoryRecord, UserProfileSummary
 from server.workers.ai_worker import AIWorker
 
 
@@ -48,6 +48,10 @@ def worker(monkeypatch) -> AIWorker:
 
     monkeypatch.setattr(ai_worker_module, "insert_interaction_log", Mock())
     monkeypatch.setattr(ai_worker_module.threading, "Thread", ImmediateThread)
+    # [Memory Summarization] 프로필 요약이 없는 기본 상태로 고정해, 이를 검증하지 않는
+    # 기존 RAG 테스트들이 실제 DB 조회를 타지 않도록 한다. 주입 자체를 검증하는 테스트는
+    # 각 테스트 본문에서 이 기본값을 개별적으로 override한다.
+    monkeypatch.setattr(ai_worker_module, "get_profile_summary", lambda *args, **kwargs: None)
     return w
 
 
@@ -164,6 +168,86 @@ def test_retrieve_memory_context_returns_empty_on_failure_without_raising(worker
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", raise_error)
 
     assert worker._retrieve_memory_context("아무 발화") == ""
+
+
+# --- _retrieve_memory_context(): [Memory Summarization] 사용자 프로필 요약 주입 ---
+
+def test_retrieve_memory_context_prepends_profile_summary_before_memories(worker, monkeypatch):
+    monkeypatch.setattr(
+        ai_worker_module,
+        "get_profile_summary",
+        lambda *args, **kwargs: UserProfileSummary(
+            user_id="primary_user", summary_text="사용자는 커피를 좋아하고 아침형 인간이다", source_memory_count=5
+        ),
+    )
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+    monkeypatch.setattr(
+        ai_worker_module,
+        "search_similar_memories",
+        lambda embedding, top_k, threshold: [
+            MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
+        ],
+    )
+
+    context = worker._retrieve_memory_context("오늘 뭐 마실까?")
+
+    assert context == (
+        "[사용자 프로필: 사용자는 커피를 좋아하고 아침형 인간이다]\n[참고 기억] 커피를 좋아한다"
+    )
+
+
+def test_retrieve_memory_context_includes_profile_summary_even_without_topk_hits(worker, monkeypatch):
+    monkeypatch.setattr(
+        ai_worker_module,
+        "get_profile_summary",
+        lambda *args, **kwargs: UserProfileSummary(
+            user_id="primary_user", summary_text="사용자는 고양이를 키운다", source_memory_count=3
+        ),
+    )
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+    monkeypatch.setattr(
+        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+    )
+
+    context = worker._retrieve_memory_context("아무 상관 없는 발화")
+
+    assert context == "[사용자 프로필: 사용자는 고양이를 키운다]"
+
+
+def test_retrieve_memory_context_omits_profile_line_when_no_summary_exists(worker, monkeypatch):
+    monkeypatch.setattr(ai_worker_module, "get_profile_summary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+    monkeypatch.setattr(
+        ai_worker_module,
+        "search_similar_memories",
+        lambda embedding, top_k, threshold: [
+            MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
+        ],
+    )
+
+    context = worker._retrieve_memory_context("오늘 뭐 마실까?")
+
+    assert context == "[참고 기억] 커피를 좋아한다"
+    assert "[사용자 프로필" not in context
+
+
+def test_retrieve_memory_context_still_returns_memories_when_profile_lookup_fails(worker, monkeypatch):
+    def raise_error(*args, **kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(ai_worker_module, "get_profile_summary", raise_error)
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
+    monkeypatch.setattr(
+        ai_worker_module,
+        "search_similar_memories",
+        lambda embedding, top_k, threshold: [
+            MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
+        ],
+    )
+
+    context = worker._retrieve_memory_context("오늘 뭐 마실까?")
+
+    assert context == "[참고 기억] 커피를 좋아한다"
 
 
 # --- process_voice_interaction(): 파이프라인 통합 훅 ---

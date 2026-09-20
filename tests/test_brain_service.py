@@ -144,3 +144,70 @@ def test_classify_memory_relation_falls_back_to_new_on_api_exception(service, mo
     result = service.classify_memory_relation("이제 사과 싫고 포도 좋아", [candidate])
 
     assert result == MemoryConflictResult(relation=MemoryRelation.NEW, conflicting_ids=[])
+
+
+# --- summarize_profile(): [Memory Summarization] 활성 기억 -> 페르소나 요약 압축 ---
+
+def test_summarize_profile_skips_llm_call_when_no_fact_texts(service, monkeypatch):
+    get_client_mock = Mock()
+    monkeypatch.setattr(service, "get_client", get_client_mock)
+
+    result = service.summarize_profile([])
+
+    assert result == ""
+    get_client_mock.assert_not_called()
+
+
+def test_summarize_profile_returns_response_text_and_keeps_thinking_budget(service, monkeypatch):
+    fake_response = Mock()
+    fake_response.text = "사용자는 커피를 좋아하고 아침형 인간이다."
+    fake_response.candidates = []
+
+    fake_client = Mock()
+    fake_client.models.generate_content.return_value = fake_response
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    result = service.summarize_profile(["커피를 좋아한다", "매일 아침 산책한다"])
+
+    assert result == "사용자는 커피를 좋아하고 아침형 인간이다."
+
+    # 가드레일: thinking_budget은 반드시 1 (0이면 400 오류, 미설정 시 지연 발생)
+    call_kwargs = fake_client.models.generate_content.call_args.kwargs
+    assert call_kwargs["config"].thinking_config.thinking_budget == 1
+    assert call_kwargs["config"].max_output_tokens >= 1024
+
+    prompt_sent = call_kwargs["contents"][0]
+    assert "커피를 좋아한다" in prompt_sent
+    assert "매일 아침 산책한다" in prompt_sent
+
+
+def test_summarize_profile_falls_back_to_candidates_parts_when_text_empty(service, monkeypatch):
+    fake_part = Mock()
+    fake_part.text = "파츠 경로로 조립된 요약문"
+    fake_content = Mock()
+    fake_content.parts = [fake_part]
+    fake_candidate = Mock()
+    fake_candidate.content = fake_content
+
+    fake_response = Mock()
+    fake_response.text = ""
+    fake_response.candidates = [fake_candidate]
+
+    fake_client = Mock()
+    fake_client.models.generate_content.return_value = fake_response
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    result = service.summarize_profile(["아무 사실"])
+
+    assert result == "파츠 경로로 조립된 요약문"
+
+
+def test_summarize_profile_returns_empty_string_on_api_exception(service, monkeypatch):
+    def raise_error():
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(service, "get_client", raise_error)
+
+    result = service.summarize_profile(["커피를 좋아한다"])
+
+    assert result == ""

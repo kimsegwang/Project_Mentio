@@ -73,3 +73,13 @@ ALTER TABLE user_long_term_memory
 
 CREATE INDEX IF NOT EXISTS idx_user_memory_active
 ON user_long_term_memory (user_id) WHERE is_active = TRUE;
+
+-- 6. [Memory Summarization] 사용자 페르소나/선호 성향 요약 프로필 테이블
+-- 활성 기억(is_active=TRUE)을 주기적으로 압축한 고수준 요약을 저장하며,
+-- 대화 프롬프트에는 개별 Top-K 기억과 함께 이 요약이 "[사용자 프로필: ...]" 형태로 주입된다.
+CREATE TABLE IF NOT EXISTS user_profile_summary (
+    user_id VARCHAR(64) PRIMARY KEY,
+    summary_text TEXT NOT NULL,
+    source_memory_count INT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);

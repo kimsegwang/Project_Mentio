@@ -13,13 +13,22 @@ threading.Thread를 던지면 두 백그라운드 스레드가 동시에 실행�
 
 submit()은 queue.put_nowait로 즉시 반환되므로 대화 턴(TTS 완료 후 호출)에는
 지연을 추가하지 않는다.
+
+[Memory Summarization 자동 트리거]
+같은 순차 큐 안에서 신규 기억이 실제로 INSERT될 때마다 사용자별 누적 카운터를 올리고,
+PROFILE_SUMMARY_TRIGGER_COUNT에 도달하거나(또는 기존 프로필 요약이 아예 없는 Cold Start
+상태의 최초 적재 시점에) memory_service.summarize_user_profile()을 같은 스레드에서
+호출한다. 별도 스케줄러 없이 기존 순차 큐에 얹는 방식이라 "대화 지연에 영향 없음"
+원칙을 그대로 유지한다.
 """
 import queue
 import threading
 import logging
-from typing import Optional, Tuple
+from collections import defaultdict
+from typing import Dict, Optional, Tuple
 
 from config import settings
+from server.repositories.memory_repository import get_profile_summary
 from server.services import memory_service
 
 logger = logging.getLogger(__name__)
@@ -30,6 +39,9 @@ class MemoryWriteWorker:
         self._queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # [Memory Summarization] 사용자별 "직전 요약 이후 신규 적재된 기억" 누적 카운터.
+        # 동일 스레드에서만 증감되므로 별도 락 없이 안전하다.
+        self._new_memory_counts: Dict[str, int] = defaultdict(int)
 
     def start(self) -> None:
         """백그라운드 단일 소비자 스레드 구동"""
@@ -60,11 +72,50 @@ class MemoryWriteWorker:
                 continue
 
             try:
-                memory_service.extract_and_store(user_text, user_id)
+                new_id = memory_service.extract_and_store(user_text, user_id)
+                if new_id is not None:
+                    self._handle_new_memory_inserted(user_id)
             except Exception as e:
                 logger.warning(f"[MemoryWriteWorker] 기억 적재 처리 중 예외 발생: {e}")
             finally:
                 self._queue.task_done()
+
+    def _handle_new_memory_inserted(self, user_id: str) -> None:
+        """
+        [Memory Summarization] 신규 기억이 실제로 INSERT된 직후(Dedup 스킵 제외) 호출된다.
+        누적 카운터가 PROFILE_SUMMARY_TRIGGER_COUNT에 도달했거나, 기존 프로필 요약이 아예
+        없는 Cold Start 상태라면 같은 스레드에서 즉시 summarize_user_profile()을 트리거한다.
+        어느 단계에서 예외가 발생해도 워커 스레드가 죽지 않도록 이 메서드 전체를 보호한다.
+        """
+        try:
+            self._new_memory_counts[user_id] += 1
+            count = self._new_memory_counts[user_id]
+
+            should_summarize = count >= settings.PROFILE_SUMMARY_TRIGGER_COUNT
+
+            if not should_summarize:
+                try:
+                    should_summarize = get_profile_summary(user_id=user_id) is None
+                except Exception as e:
+                    logger.warning(f"[MemoryWriteWorker] Cold Start 판별용 프로필 조회 실패: {e}")
+
+            if not should_summarize:
+                return
+
+            logger.info(
+                f"[MemoryWriteWorker] 프로필 요약 자동 트리거 발동 (user: {user_id}, 누적 신규 기억: {count}개)"
+            )
+            result = memory_service.summarize_user_profile(user_id=user_id)
+
+            if result is not None:
+                self._new_memory_counts[user_id] = 0
+                logger.info(f"[MemoryWriteWorker] 프로필 요약 갱신 및 누적 카운터 리셋 완료 (user: {user_id})")
+            else:
+                logger.warning(
+                    f"[MemoryWriteWorker] 프로필 요약 트리거되었으나 결과 없음, 카운터 유지 (user: {user_id})"
+                )
+        except Exception as e:
+            logger.warning(f"[MemoryWriteWorker] 프로필 요약 자동 트리거 처리 중 예외 발생: {e}")
 
 
 # Spring Bean 스타일 전역 싱글톤 등록

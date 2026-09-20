@@ -8,7 +8,7 @@ import numpy as np
 from config import settings
 from server.repositories.log_repository import insert_interaction_log
 from server.repositories.preset_repository import load_emotion_presets, get_preset_for_emotion
-from server.repositories.memory_repository import search_similar_memories
+from server.repositories.memory_repository import get_profile_summary, search_similar_memories
 from server.schemas.action import RobotAction, LLMResponse, TriggerType
 from server.services.brain_service import BrainService, brain_service
 from server.services.stt_service import stt_service
@@ -91,8 +91,20 @@ class AIWorker:
         """
         [RAG Retrieval] 사용자 발화를 로컬 임베딩 후 pgvector에서 Top-K 유사 기억을 조회하여
         "[참고 기억] ..." 형태의 간결한 컨텍스트 문자열로 조립한다.
-        검색 실패 시에도 대화 파이프라인이 끊기지 않도록 빈 문자열을 반환한다.
+        [Memory Summarization] 여기에 더해 user_profile_summary에 저장된 고수준 페르소나 요약을
+        "[사용자 프로필: ...]" 형태로 함께 주입해, 낱개 Top-K 기억만으로는 드러나지 않는
+        사용자의 전반적인 성향/선호를 매 턴 저비용(단순 조회, LLM 재호출 없음)으로 반영한다.
+        검색/조회 실패 시에도 대화 파이프라인이 끊기지 않도록 해당 구간만 생략한다.
         """
+        context_lines = []
+
+        try:
+            profile = get_profile_summary()
+            if profile and profile.summary_text:
+                context_lines.append(f"[사용자 프로필: {profile.summary_text}]")
+        except Exception as e:
+            print(f"[AIWorker RAG Warning] 프로필 요약 조회 실패: {e}")
+
         try:
             query_embedding = embedding_service.embed(user_text)
 
@@ -108,17 +120,18 @@ class AIWorker:
             memories = search_similar_memories(query_embedding, top_k=settings.RAG_TOP_K, threshold=threshold)
         except Exception as e:
             print(f"[AIWorker RAG Warning] 장기 기억 검색 실패: {e}")
-            return ""
+            return "\n".join(context_lines)
 
         if not memories:
             print(f"🧠 [RAG] 임계값({threshold}) 이상의 관련 기억 없음, 컨텍스트 주입 생략")
-            return ""
+            return "\n".join(context_lines)
 
         for memory in memories:
             score = f"{memory.similarity:.2f}" if memory.similarity is not None else "N/A"
             print(f"🧠 [RAG] [참고 기억] {memory.fact_text} (유사도: {score})")
 
-        return "\n".join(f"[참고 기억] {memory.fact_text}" for memory in memories)
+        context_lines.extend(f"[참고 기억] {memory.fact_text}" for memory in memories)
+        return "\n".join(context_lines)
 
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
