@@ -69,3 +69,13 @@ RAG_CONFLICT_CANDIDATE_THRESHOLD = 0.55  # 이 값 이상 RAG_DEDUP_SIMILARITY_T
 # 않도록 후보 구간만 좁혀 호출 비용을 최소화한다. 초기값이며, Dedup 임계값과 동일하게 실기 로그
 # 기반 반복 튜닝이 필요할 수 있다.
 RAG_CONFLICT_TOP_K = 3  # 모순 판정 LLM 호출 시 전달할 후보 기억 개수 상한.
+
+# --- Memory Summarization(장기 기억 요약) 설정 ---
+PROFILE_SUMMARY_SOURCE_LIMIT = 50  # 프로필 요약 생성 시 반영할 활성 기억(is_active=TRUE) 최대 개수.
+# 대화 턴과 무관한 배치/백그라운드 파이프라인이므로 RAG_TOP_K(2)처럼 엄격히 제한할 필요는 없으나,
+# 사용자당 기억이 무한정 쌓였을 때 단일 LLM 호출 프롬프트가 과도하게 길어지는 것을 방지하는 상한이다.
+
+PROFILE_SUMMARY_TRIGGER_COUNT = 5  # MemoryWriteWorker가 신규 기억을 이 개수만큼 누적 적재하면
+# summarize_user_profile()을 자동으로 트리거한다. 근접 중복(Dedup)으로 스킵된 발화는 실제 INSERT가
+# 아니므로 이 카운트에 포함하지 않는다. 기존 프로필 요약이 아예 없는 Cold Start 상태에서는
+# 이 개수에 도달하기 전이라도 최초 신규 기억 적재 시점에 즉시 트리거한다.

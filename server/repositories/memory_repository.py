@@ -5,7 +5,7 @@ from pgvector.psycopg2 import register_vector
 
 from config import settings
 from server.repositories.connection import get_db_connection
-from server.schemas.memory import EmbeddingVector, MemoryRecord
+from server.schemas.memory import EmbeddingVector, MemoryRecord, UserProfileSummary
 
 logger = logging.getLogger(__name__)
 
@@ -95,3 +95,82 @@ def search_similar_memories(
     except Exception as e:
         logger.error(f"[MemoryRepository Error] 장기 기억 검색 실패: {e}")
         return []
+
+
+def get_active_memories(
+    user_id: str = settings.DEFAULT_USER_ID,
+    limit: int = settings.PROFILE_SUMMARY_SOURCE_LIMIT,
+) -> List[MemoryRecord]:
+    """
+    [Memory Summarization] 무효화되지 않은(is_active=TRUE) 기억을 최신순으로 최대 limit개 조회한다.
+    MemoryService.summarize_user_profile()이 요약 생성 소스 데이터로 사용한다.
+    """
+    query = """
+        SELECT id, user_id, fact_text, created_at
+        FROM user_long_term_memory
+        WHERE user_id = %s AND is_active = TRUE
+        ORDER BY created_at DESC
+        LIMIT %s;
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (user_id, limit))
+                rows = cursor.fetchall()
+                return [
+                    MemoryRecord(id=row[0], user_id=row[1], fact_text=row[2], created_at=row[3])
+                    for row in rows
+                ]
+    except Exception as e:
+        logger.error(f"[MemoryRepository Error] 활성 기억 목록 조회 실패: {e}")
+        return []
+
+
+def upsert_profile_summary(user_id: str, summary_text: str, source_memory_count: int) -> None:
+    """
+    [Memory Summarization] 사용자 페르소나 요약을 user_profile_summary에 UPSERT한다.
+    MemoryService.summarize_user_profile()에서만 호출된다.
+    """
+    query = """
+        INSERT INTO user_profile_summary (user_id, summary_text, source_memory_count, updated_at)
+        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (user_id) DO UPDATE
+        SET summary_text = EXCLUDED.summary_text,
+            source_memory_count = EXCLUDED.source_memory_count,
+            updated_at = CURRENT_TIMESTAMP;
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (user_id, summary_text, source_memory_count))
+            conn.commit()
+            logger.info(
+                f"[MemoryRepository] 프로필 요약 UPSERT 완료 (user: {user_id}, source_count: {source_memory_count})"
+            )
+    except Exception as e:
+        logger.error(f"[MemoryRepository Error] 프로필 요약 저장 실패: {e}")
+
+
+def get_profile_summary(user_id: str = settings.DEFAULT_USER_ID) -> Optional[UserProfileSummary]:
+    """
+    [Memory Summarization] 대화 컨텍스트 조립 시 주입할 사용자 프로필 요약을 조회한다.
+    아직 요약이 생성되지 않았거나 조회 실패 시에는 None을 반환해 호출부가 안전하게 생략할 수 있게 한다.
+    """
+    query = """
+        SELECT user_id, summary_text, source_memory_count, updated_at
+        FROM user_profile_summary
+        WHERE user_id = %s;
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (user_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return UserProfileSummary(
+                    user_id=row[0], summary_text=row[1], source_memory_count=row[2], updated_at=row[3]
+                )
+    except Exception as e:
+        logger.error(f"[MemoryRepository Error] 프로필 요약 조회 실패: {e}")
+        return None

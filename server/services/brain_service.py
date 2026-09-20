@@ -54,6 +54,16 @@ class BrainService:
             '{"relation": "CONTRADICTS", "conflicting_ids": [3]}\n'
             '모순이 없으면: {"relation": "NEW", "conflicting_ids": []}'
         )
+        # [Memory Summarization] 활성 기억 목록 -> 고수준 페르소나 요약문 압축 전용 system instruction.
+        # infer_action/classify_memory_relation과 무관한 별도 목적이므로 프롬프트를 분리한다.
+        self.profile_summary_system_instruction = (
+            "너는 로봇 Mentio가 사용자에 대해 낱개로 기억해 온 사실들을 종합해 "
+            "하나의 자연스러운 한국어 페르소나 요약문으로 압축하는 역할이다.\n"
+            "[기억 목록]에 나열된 사실들만 근거로 사용자의 성향/취향/생활 패턴을 알 수 있는 "
+            "3~4문장 내외의 하나의 문단으로 요약하라.\n"
+            "목록에 없는 내용을 추측하거나 지어내지 말고, 영어 인사말/마크다운/따옴표/JSON 없이 "
+            "오직 순수 한국어 요약 문단 텍스트만 출력하라."
+        )
 
     def get_client(self) -> genai.Client:
         if self._client is None:
@@ -224,6 +234,56 @@ class BrainService:
         except Exception as e:
             logger.warning(f"[BrainService] 기억 모순 판정 실패, 안전하게 NEW로 폴백: {e}")
             return MemoryConflictResult(relation=MemoryRelation.NEW, conflicting_ids=[])
+
+    def summarize_profile(self, fact_texts: List[str]) -> str:
+        """
+        [Memory Summarization] 활성 기억 목록을 하나의 고수준 페르소나 요약문으로 압축한다.
+        MemoryService.summarize_user_profile()이 대화 턴과 무관한 배치/백그라운드 파이프라인에서만
+        호출하므로, infer_action(실시간 대화)만큼 엄격한 지연 요구사항은 없다.
+        요약 결과는 정형 JSON이 아닌 순수 텍스트이므로 _extract_json_object 파서를 거치지 않는다
+        (parse_action_json/classify_memory_relation 전용 Auto-healing 로직과는 별개 목적).
+        """
+        if not fact_texts:
+            return ""
+
+        facts_block = "\n".join(f"- {text}" for text in fact_texts)
+        prompt = f"[기억 목록]\n{facts_block}"
+
+        # ⚡ infer_action/classify_memory_relation과 동일한 사유로 thinking_budget은 0이 아닌 1을 유지한다
+        # (0 주입 시 400 INVALID_ARGUMENT, 미설정 시 기본 추론 프로세스로 인한 지연 발생).
+        config = types.GenerateContentConfig(
+            system_instruction=self.profile_summary_system_instruction,
+            temperature=0.3,
+            max_output_tokens=1024,
+            thinking_config=types.ThinkingConfig(thinking_budget=1),
+        )
+
+        try:
+            client = self.get_client()
+            response = client.models.generate_content(
+                model=settings.GEMINI_MODEL_NAME,
+                contents=[prompt],
+                config=config,
+            )
+
+            raw_text = ""
+            try:
+                raw_text = response.text or ""
+            except Exception:
+                pass
+
+            if not raw_text and response.candidates:
+                first_cand = response.candidates[0]
+                if first_cand.content and first_cand.content.parts:
+                    raw_text = "".join(
+                        [p.text for p in first_cand.content.parts if hasattr(p, "text") and p.text]
+                    )
+
+            return raw_text.strip()
+
+        except Exception as e:
+            logger.warning(f"[BrainService] 프로필 요약 생성 실패: {e}")
+            return ""
 
 
 # Spring Bean 싱글톤 등록

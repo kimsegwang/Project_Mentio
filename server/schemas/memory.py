@@ -45,3 +45,15 @@ class MemoryConflictResult(BaseModel):
         default_factory=list,
         description="relation=CONTRADICTS일 때 무효화(is_active=FALSE) 대상 기존 기억의 id 목록",
     )
+
+
+class UserProfileSummary(BaseModel):
+    """
+    user_profile_summary 테이블 레코드 DTO.
+    MemoryService.summarize_user_profile()이 활성 기억들을 압축해 생성하며,
+    대화 컨텍스트 조립 시 "[사용자 프로필: ...]" 형태로 시스템 프롬프트에 주입된다.
+    """
+    user_id: str = Field(description="기억 소유 사용자 식별자")
+    summary_text: str = Field(min_length=1, description="활성 기억을 압축한 고수준 페르소나/선호 성향 요약문")
+    source_memory_count: int = Field(default=0, description="요약 생성 시점에 반영된 활성 기억 개수")
+    updated_at: Optional[datetime] = Field(default=None, description="요약 갱신 시각")

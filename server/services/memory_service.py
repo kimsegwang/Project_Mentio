@@ -6,9 +6,17 @@ TTS 완료 후 Background Task에서 임베딩 및 DB 적재를 수행한다.
 """
 import logging
 
+from typing import Optional
+
 from config import settings
-from server.repositories.memory_repository import insert_memory, invalidate_memories, search_similar_memories
-from server.schemas.memory import MemoryRelation
+from server.repositories.memory_repository import (
+    get_active_memories,
+    insert_memory,
+    invalidate_memories,
+    search_similar_memories,
+    upsert_profile_summary,
+)
+from server.schemas.memory import MemoryRelation, UserProfileSummary
 from server.services.brain_service import brain_service
 from server.services.embedding_service import embedding_service
 
@@ -46,7 +54,7 @@ def is_memorable(text: str) -> bool:
     return len(stripped) >= MIN_MEMORABLE_LENGTH
 
 
-def extract_and_store(user_text: str, user_id: str = settings.DEFAULT_USER_ID) -> None:
+def extract_and_store(user_text: str, user_id: str = settings.DEFAULT_USER_ID) -> Optional[int]:
     """
     TTS 완료 후 Background Task(MemoryWriteWorker의 순차 스레드)에서 호출된다.
     규칙 기반 필터를 통과한 발화만 로컬 임베딩 후:
@@ -55,9 +63,13 @@ def extract_and_store(user_text: str, user_id: str = settings.DEFAULT_USER_ID) -
          경량 LLM Reflection(BrainService.classify_memory_relation)으로 모순 여부 판정 후,
          모순이면 기존 기억을 is_active=FALSE로 무효화하고 신규 사실로 대체
       3) 그 외에는 그대로 신규 적재
+
+    반환값은 실제로 신규 INSERT가 일어난 경우에만 그 id를 담고, 필터 탈락/근접 중복 스킵/예외
+    상황에서는 None을 반환한다. MemoryWriteWorker가 이 값으로 "실제 신규 적재 여부"를 판별해
+    프로필 요약 자동 트리거의 누적 카운터를 올릴지 결정하는 데 사용한다.
     """
     if not is_memorable(user_text):
-        return
+        return None
 
     try:
         embedding = embedding_service.embed(user_text)
@@ -72,7 +84,7 @@ def extract_and_store(user_text: str, user_id: str = settings.DEFAULT_USER_ID) -
             logger.info(
                 f"🧠 [MemoryService] 중복 기억 감지(유사도: {top_match.similarity:.2f}), 저장 스킵: {user_text[:30]}..."
             )
-            return
+            return None
 
         conflict_candidates = [
             m for m in nearest
@@ -104,5 +116,39 @@ def extract_and_store(user_text: str, user_id: str = settings.DEFAULT_USER_ID) -
             )
         else:
             logger.info(f"🧠 [MemoryService] 신규 기억 적재: {user_text[:30]}...")
+
+        return new_id
     except Exception as e:
         logger.warning(f"[MemoryService] 장기 기억 비동기 적재 실패: {e}")
+        return None
+
+
+def summarize_user_profile(user_id: str = settings.DEFAULT_USER_ID) -> Optional[UserProfileSummary]:
+    """
+    [Memory Summarization] 활성 기억(is_active=TRUE)들을 모아 BrainService의 경량 LLM 호출로
+    사용자 페르소나/선호 성향 요약문으로 압축하고 user_profile_summary에 UPSERT한다.
+    정기 배치/관리자 트리거로 호출되는 파이프라인이며, 대화 턴 지연과는 무관하다.
+    활성 기억이 없거나 요약 생성에 실패하면 저장을 스킵하고 None을 반환한다.
+    """
+    try:
+        memories = get_active_memories(user_id=user_id, limit=settings.PROFILE_SUMMARY_SOURCE_LIMIT)
+        if not memories:
+            logger.info(f"[MemoryService] 활성 기억이 없어 프로필 요약을 생략합니다 (user: {user_id})")
+            return None
+
+        fact_texts = [memory.fact_text for memory in memories]
+        summary_text = brain_service.summarize_profile(fact_texts).strip()
+
+        if not summary_text:
+            logger.warning(f"[MemoryService] 프로필 요약 생성 결과가 비어있어 저장을 스킵합니다 (user: {user_id})")
+            return None
+
+        upsert_profile_summary(user_id=user_id, summary_text=summary_text, source_memory_count=len(memories))
+        logger.info(f"[MemoryService] 프로필 요약 갱신 완료 (user: {user_id}, 소스 기억: {len(memories)}개)")
+
+        return UserProfileSummary(
+            user_id=user_id, summary_text=summary_text, source_memory_count=len(memories)
+        )
+    except Exception as e:
+        logger.warning(f"[MemoryService] 프로필 요약 파이프라인 실패: {e}")
+        return None
