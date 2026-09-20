@@ -18,6 +18,7 @@ from server.services.question_detector import question_detector
 from server.workers.memory_write_worker import memory_write_worker
 from server.services.tts_service import TTSService
 from server.services.audio_player_service import AudioPlayerService
+from server.adapters.audio_io import AudioSink
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class AIWorker:
         self,
         brain_service_instance: BrainService = brain_service,
         tts_service_instance: Optional[TTSService] = None,
-        audio_player_instance: Optional[AudioPlayerService] = None,
+        audio_player_instance: Optional[AudioSink] = None,
         on_task_completed: Optional[callable] = None, # 💡 콜백 주입받기
     ):
         self.brain_service = brain_service_instance

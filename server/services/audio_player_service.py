@@ -4,11 +4,12 @@ import time
 import logging
 import pygame
 from config.settings import AUDIO_REVERB_GUARD_SEC
+from server.adapters.audio_io import AudioSink
 
 logger = logging.getLogger("AudioPlayerService")
 
 
-class AudioPlayerService:
+class AudioPlayerService(AudioSink):
     def __init__(self):
         if not pygame.mixer.get_init():
             pygame.mixer.init(frequency=24000, size=-16, channels=2, buffer=2048)

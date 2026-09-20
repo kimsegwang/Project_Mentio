@@ -13,7 +13,9 @@ from server.repositories.connection import init_db_pool, close_db_pool
 from server.schemas.action import RobotAction
 from server.services.brain_service import BrainService
 from server.services.vision_service import VisionService
-from server.services.audio_listener_service import audio_listener_service
+from server.adapters.audio_io import AudioSource, AudioSink
+from server.services.audio_listener_service import AudioListenerService
+from server.services.audio_player_service import AudioPlayerService
 from server.workers.ai_worker import AIWorker
 from server.workers.memory_write_worker import memory_write_worker
 from server.repositories.preset_repository import get_preset_for_emotion
@@ -48,12 +50,12 @@ def handle_voice_interaction_thread(ai_worker: AIWorker, audio_data, pil_snapsho
             is_processing = False
 
 
-def audio_listener_worker(ai_worker: AIWorker, vision_service: VisionService):
+def audio_listener_worker(ai_worker: AIWorker, vision_service: VisionService, audio_source: AudioSource):
     global flash_trigger_time, is_processing
     print("[AudioWorker] 음성 감지 리스너 스레드 시작.")
-    
+
     while not stop_event.is_set():
-        audio_data = audio_listener_service.listen_phrase()
+        audio_data = audio_source.listen_phrase()
         
         if stop_event.is_set():
             break
@@ -97,10 +99,18 @@ def run_mentio_engine():
     init_db_pool()
 
     # 2. 서비스 및 워커 레이어 인스턴스화
+    # 💡 [DIP] 오디오 입출력은 인터페이스(AudioSource/AudioSink) 타입으로 다루며,
+    #    구체적인 PC 구현체(sounddevice/pygame)는 이 조립 지점(Composition Root)에서만 생성한다.
+    #    추후 ESP32 WebSocket 스트리밍 어댑터로 교체 시 아래 두 줄만 바꾸면 되고,
+    #    도메인 서비스(AIWorker, BrainService 등) 코드는 0줄 수정으로 유지된다.
+    audio_source: AudioSource = AudioListenerService()
+    audio_sink: AudioSink = AudioPlayerService()
+
     vision_service = VisionService()
     brain_service = BrainService()
     ai_worker = AIWorker(
         brain_service_instance=brain_service,
+        audio_player_instance=audio_sink,
         on_task_completed=release_processing_lock  # 💡 락 해제 콜백 전달
     )
     ai_worker.start()
@@ -119,7 +129,7 @@ def run_mentio_engine():
     stop_event.clear()
     audio_thread = threading.Thread(
         target=audio_listener_worker,
-        args=(ai_worker, vision_service),
+        args=(ai_worker, vision_service, audio_source),
         daemon=True
     )
     audio_thread.start()

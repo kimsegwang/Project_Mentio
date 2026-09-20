@@ -9,10 +9,12 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
+from server.adapters.audio_io import AudioSource
+
 logger = logging.getLogger(__name__)
 
 
-class AudioListenerService:
+class AudioListenerService(AudioSource):
     def __init__(
         self,
         sample_rate: int = 16000,
