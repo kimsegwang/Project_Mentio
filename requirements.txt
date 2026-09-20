@@ -21,6 +21,9 @@ pgvector>=0.2.5
 # --- RAG 장기 기억 (로컬 경량 임베딩) ---
 fastembed>=0.3.0
 
+# --- 화자 식별 (Speaker Verification, 경량 CPU 추론) ---
+resemblyzer>=0.1.4
+
 # --- 음성 합성 (TTS) & 오디오 출력 ---
 edge-tts>=6.1.0
 pygame>=2.5.0
