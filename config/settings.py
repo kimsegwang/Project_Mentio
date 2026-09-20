@@ -79,3 +79,17 @@ PROFILE_SUMMARY_TRIGGER_COUNT = 5  # MemoryWriteWorker가 신규 기억을 이 �
 # summarize_user_profile()을 자동으로 트리거한다. 근접 중복(Dedup)으로 스킵된 발화는 실제 INSERT가
 # 아니므로 이 카운트에 포함하지 않는다. 기존 프로필 요약이 아예 없는 Cold Start 상태에서는
 # 이 개수에 도달하기 전이라도 최초 신규 기억 적재 시점에 즉시 트리거한다.
+
+# --- 화자 식별(Speaker Verification) 설정 ---
+SPEAKER_VERIFICATION_ENABLED = os.getenv("SPEAKER_VERIFICATION_ENABLED", "true").lower() == "true"
+# False로 끄거나, 기준 화자가 아직 등록되지 않은 경우(등록 파일 없음) SpeakerService.verify()는
+# 안전하게 검증을 스킵(통과)한다. 즉 "미등록 = 차단"이 아니라 "미등록 = 무검증 통과"가 기본 동작이다.
+
+SPEAKER_REFERENCE_EMBEDDING_PATH = os.getenv(
+    "SPEAKER_REFERENCE_EMBEDDING_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "speaker_profiles", "primary_user.npy"),
+)  # scripts/enroll_speaker.py가 기준 화자(primary_user) 임베딩을 저장하는 경로.
+
+SPEAKER_VERIFICATION_THRESHOLD = float(os.getenv("SPEAKER_VERIFICATION_THRESHOLD", "0.75"))
+# Resemblyzer 임베딩 기준 코사인 유사도 임계값. 이 값 미만이면 제3자 발화/TV 소리 등으로
+# 판단해 파이프라인 진입을 차단한다. 실기 튜닝이 필요할 수 있는 초기값이다.

@@ -15,6 +15,7 @@ from server.services.stt_service import stt_service
 from server.services.intent_service import intent_service
 from server.services.embedding_service import embedding_service
 from server.services.question_detector import question_detector
+from server.services.speaker_service import SpeakerService, speaker_service
 from server.workers.memory_write_worker import memory_write_worker
 from server.services.tts_service import TTSService
 from server.services.audio_player_service import AudioPlayerService
@@ -29,11 +30,13 @@ class AIWorker:
         brain_service_instance: BrainService = brain_service,
         tts_service_instance: Optional[TTSService] = None,
         audio_player_instance: Optional[AudioSink] = None,
+        speaker_service_instance: SpeakerService = speaker_service,
         on_task_completed: Optional[callable] = None, # 💡 콜백 주입받기
     ):
         self.brain_service = brain_service_instance
         self.tts_service = tts_service_instance or TTSService()
         self.audio_player = audio_player_instance or AudioPlayerService()
+        self.speaker_service = speaker_service_instance
         self.on_task_completed = on_task_completed
 
         self.request_queue: queue.Queue[Tuple[str, str, List[Any], float]] = queue.Queue(maxsize=1)
@@ -197,6 +200,11 @@ class AIWorker:
         current_frame: Optional[Any] = None
     ) -> Optional[RobotAction]:
         total_start = time.time()
+
+        # 0. 화자 검증 (VAD 직후, STT 이전) - 미등록/비활성화 시 자동 스킵(통과)
+        if not self.speaker_service.verify(audio_data):
+            print("[AIWorker] 화자 검증 실패 -> 등록되지 않은 화자로 판단, 파이프라인 진입을 차단합니다.")
+            return None
 
         # 1. STT 변환
         t0 = time.time()
