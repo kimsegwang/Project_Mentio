@@ -202,7 +202,13 @@ class AIWorker:
         total_start = time.time()
 
         # 0. 화자 검증 (VAD 직후, STT 이전) - 미등록/비활성화 시 자동 스킵(통과)
-        if not self.speaker_service.verify(audio_data):
+        verification = self.speaker_service.verify(audio_data)
+        if verification.similarity is not None:
+            print(
+                f"🔒 [AIWorker] 화자 검증 점수: {verification.similarity:.3f} "
+                f"(기준: {verification.threshold:.3f}) -> {'통과' if verification.is_match else '실패 (차단)'}"
+            )
+        if not verification.is_match:
             print("[AIWorker] 화자 검증 실패 -> 등록되지 않은 화자로 판단, 파이프라인 진입을 차단합니다.")
             return None
 
