@@ -91,19 +91,21 @@ class AIWorker:
         except Exception as e:
             print(f"[AIWorker TTS Warning] 음성 재생 실패: {e}")
 
-    def _retrieve_memory_context(self, user_text: str) -> str:
+    def _retrieve_memory_context(self, user_text: str, user_id: str = settings.DEFAULT_USER_ID) -> str:
         """
         [RAG Retrieval] 사용자 발화를 로컬 임베딩 후 pgvector에서 Top-K 유사 기억을 조회하여
         "[참고 기억] ..." 형태의 간결한 컨텍스트 문자열로 조립한다.
         [Memory Summarization] 여기에 더해 user_profile_summary에 저장된 고수준 페르소나 요약을
         "[사용자 프로필: ...]" 형태로 함께 주입해, 낱개 Top-K 기억만으로는 드러나지 않는
         사용자의 전반적인 성향/선호를 매 턴 저비용(단순 조회, LLM 재호출 없음)으로 반영한다.
+        [다중 사용자 격리] user_id로 조회 범위를 한정해, 식별된 화자 본인의 프로필/기억만
+        조회하고 다른 가족 구성원의 기억이 섞여 들어오지 않도록 한다.
         검색/조회 실패 시에도 대화 파이프라인이 끊기지 않도록 해당 구간만 생략한다.
         """
         context_lines = []
 
         try:
-            profile = get_profile_summary()
+            profile = get_profile_summary(user_id=user_id)
             if profile and profile.summary_text:
                 context_lines.append(f"[사용자 프로필: {profile.summary_text}]")
         except Exception as e:
@@ -121,7 +123,9 @@ class AIWorker:
             if is_question:
                 print(f"🧠 [RAG] 의문문 감지 -> 완화된 임계값({threshold}) 적용")
 
-            memories = search_similar_memories(query_embedding, top_k=settings.RAG_TOP_K, threshold=threshold)
+            memories = search_similar_memories(
+                query_embedding, user_id=user_id, top_k=settings.RAG_TOP_K, threshold=threshold
+            )
         except Exception as e:
             print(f"[AIWorker RAG Warning] 장기 기억 검색 실패: {e}")
             return "\n".join(context_lines)
@@ -201,16 +205,21 @@ class AIWorker:
     ) -> Optional[RobotAction]:
         total_start = time.time()
 
-        # 0. 화자 검증 (VAD 직후, STT 이전) - 미등록/비활성화 시 자동 스킵(통과)
-        verification = self.speaker_service.verify(audio_data)
-        if verification.similarity is not None:
+        # 0. 화자 식별 (VAD 직후, STT 이전) - 미등록 화자 전무/비활성화 시 자동 스킵(DEFAULT_USER_ID로 통과)
+        #    [다중 사용자 격리] 여기서 판정된 user_id가 이후 RAG 검색/프로필 조회/장기 기억
+        #    적재까지 일관되게 전달되어, 화자별 데이터가 서로 섞이지 않도록 한다.
+        identification = self.speaker_service.identify_speaker(audio_data)
+        if identification.similarity is not None:
             print(
-                f"🔒 [AIWorker] 화자 검증 점수: {verification.similarity:.3f} "
-                f"(기준: {verification.threshold:.3f}) -> {'통과' if verification.is_match else '실패 (차단)'}"
+                f"🔒 [AIWorker] 화자 식별 점수: {identification.similarity:.3f} "
+                f"(기준: {identification.threshold:.3f}) -> "
+                f"{'통과 (user: ' + str(identification.user_id) + ')' if identification.is_match else '실패 (차단)'}"
             )
-        if not verification.is_match:
-            print("[AIWorker] 화자 검증 실패 -> 등록되지 않은 화자로 판단, 파이프라인 진입을 차단합니다.")
+        if not identification.is_match:
+            print("[AIWorker] 화자 식별 실패 -> 등록되지 않은 화자로 판단, 파이프라인 진입을 차단합니다.")
             return None
+
+        user_id = identification.user_id or settings.DEFAULT_USER_ID
 
         # 1. STT 변환
         t0 = time.time()
@@ -240,7 +249,7 @@ class AIWorker:
         else:
             # 2-2. [RAG Retrieval] 시간 룰 질의가 아닐 때만 장기 기억 검색 (Top-K=2)
             t_rag = time.time()
-            memory_context = self._retrieve_memory_context(user_text)
+            memory_context = self._retrieve_memory_context(user_text, user_id=user_id)
             rag_latency = time.time() - t_rag
             if memory_context:
                 print(f"🧠 [RAG] 장기 기억 컨텍스트 주입 ({rag_latency*1000:.1f}ms):\n{memory_context}")
@@ -306,7 +315,7 @@ class AIWorker:
         #    MemoryWriteWorker의 순차 큐에 위임해, 연속 발화 시 모순 판정/무효화 순서가
         #    실제 발화 순서와 뒤바뀌는 경쟁 상태를 방지한다.
         if trigger_str != TriggerType.VOICE_TIME_RULE.value:
-            memory_write_worker.submit(user_text)
+            memory_write_worker.submit(user_text, user_id=user_id)
 
         return action
 

@@ -117,3 +117,8 @@ SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC = 10.0
 # 발화는, 이번 발화의 유사도가 임계값에 미달하더라도 "같은 대화 세션이 이어지는 중"으로
 # 간주해 소프트패스로 통과시킨다. 연속 대화 중 짧은 맞장구("어", "음")로 인해 정상 사용자의
 # 세션이 중간에 끊기는 것을 방지하기 위함이다.
+
+# --- 다중 사용자 화자 식별(Multi-user Speaker Identification) 설정 ---
+SPEAKER_EMBEDDING_DIM = 256
+# Resemblyzer VoiceEncoder.embed_utterance()가 반환하는 d-vector 차원(고정값).
+# speaker_profiles.speaker_embedding 컬럼의 VECTOR(256) 크기와 반드시 일치해야 한다.

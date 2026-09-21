@@ -83,3 +83,16 @@ CREATE TABLE IF NOT EXISTS user_profile_summary (
     source_memory_count INT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 7. [다중 사용자 화자 식별] 등록된 화자(가족 구성원) 프로필 테이블
+-- ⚠️ 기존 단일 .npy 파일(primary_user.npy) 방식을 대체한다. 절대 DROP하지 않는다
+--    (재기동/스키마 재적용 시 가족 구성원 화자 등록 정보 유실 방지).
+-- Resemblyzer VoiceEncoder d-vector 기준 256차원 고정(config.settings.SPEAKER_EMBEDDING_DIM).
+CREATE TABLE IF NOT EXISTS speaker_profiles (
+    user_id VARCHAR(64) PRIMARY KEY,
+    display_name VARCHAR(100) NOT NULL,
+    speaker_embedding VECTOR(256) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
