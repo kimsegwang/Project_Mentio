@@ -90,6 +90,30 @@ SPEAKER_REFERENCE_EMBEDDING_PATH = os.getenv(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "speaker_profiles", "primary_user.npy"),
 )  # scripts/enroll_speaker.py가 기준 화자(primary_user) 임베딩을 저장하는 경로.
 
-SPEAKER_VERIFICATION_THRESHOLD = float(os.getenv("SPEAKER_VERIFICATION_THRESHOLD", "0.75"))
+SPEAKER_VERIFICATION_THRESHOLD = float(os.getenv("SPEAKER_VERIFICATION_THRESHOLD", "0.65"))
 # Resemblyzer 임베딩 기준 코사인 유사도 임계값. 이 값 미만이면 제3자 발화/TV 소리 등으로
-# 판단해 파이프라인 진입을 차단한다. 실기 튜닝이 필요할 수 있는 초기값이다.
+# 판단해 파이프라인 진입을 차단한다.
+# 튜닝 히스토리:
+#   - 초기값 0.75 -> 실기 테스트에서 본인 목소리인데도 발화의 60% 이상이 차단되는 현상이
+#     확인됨. 원인 조사 결과 검증 로그가 콘솔에 전혀 보이지 않아(logger 핸들러 미구성) 실측
+#     유사도 점수를 확인할 수 없었던 것이 원인 파악을 늦췄고, 콘솔 핸들러를 명시 구성해 점수를
+#     직접 확인해보니 정상 발화도 0.65~0.74 구간에 다수 분포함이 확인되어 0.68로 1차 하향.
+#   - 0.68 -> 상세 로깅 반영 후 재측정한 정상 발화 점수 분포(0.799, 0.678, 0.686, 0.829,
+#     0.703)에서 0.678이 0.68에 아깝게 컷오프되는 사례가 확인되어, 더 안정적인 여유폭
+#     확보를 위해 0.65로 최종 하향함.
+
+SPEAKER_SHORT_UTTERANCE_MAX_SEC = 1.0
+# 이 길이(초) 이하의 발화는 "짧은 발화"로 간주해 SPEAKER_SHORT_UTTERANCE_THRESHOLD를 적용한다.
+# Resemblyzer는 발화 길이가 짧을수록(예: "네", "응") 화자 특징을 충분히 추출하지 못해 동일
+# 화자의 발화조차 유사도 점수가 급락하는 경향이 실기 로그로 확인되었다.
+
+SPEAKER_SHORT_UTTERANCE_THRESHOLD = 0.60
+# 짧은 발화(SPEAKER_SHORT_UTTERANCE_MAX_SEC 이하)에 한해서만 적용하는 완화된 임계값.
+# 일반 발화 임계값(SPEAKER_VERIFICATION_THRESHOLD)과 분리해, 충분히 긴 발화에 대해서는
+# 여전히 엄격한 기준을 유지한다.
+
+SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC = 10.0
+# 직전에 화자 검증을 통과(하드/소프트패스 무관)한 시점으로부터 이 시간(초) 이내에 들어온
+# 발화는, 이번 발화의 유사도가 임계값에 미달하더라도 "같은 대화 세션이 이어지는 중"으로
+# 간주해 소프트패스로 통과시킨다. 연속 대화 중 짧은 맞장구("어", "음")로 인해 정상 사용자의
+# 세션이 중간에 끊기는 것을 방지하기 위함이다.
