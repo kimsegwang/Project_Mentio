@@ -26,7 +26,7 @@ import pytest
 import server.services.speaker_service as speaker_service_module
 import server.workers.ai_worker as ai_worker_module
 from server.schemas.action import EmotionType, LLMResponse, TriggerType
-from server.schemas.speaker import SpeakerVerificationResult
+from server.schemas.speaker import SpeakerIdentificationResult, SpeakerVerificationResult
 from server.services.speaker_service import SpeakerService
 from server.workers.ai_worker import AIWorker
 
@@ -367,7 +367,7 @@ def _build_worker(speaker_service_instance):
 
 def test_process_voice_interaction_blocks_before_stt_when_speaker_rejected(monkeypatch):
     rejecting_speaker_service = Mock()
-    rejecting_speaker_service.verify.return_value = SpeakerVerificationResult(
+    rejecting_speaker_service.identify_speaker.return_value = SpeakerIdentificationResult(
         is_match=False, similarity=0.412, threshold=0.68
     )
     worker = _build_worker(rejecting_speaker_service)
@@ -380,13 +380,13 @@ def test_process_voice_interaction_blocks_before_stt_when_speaker_rejected(monke
 
     assert result is None
     stt_mock.assert_not_called()
-    rejecting_speaker_service.verify.assert_called_once_with(audio_data)
+    rejecting_speaker_service.identify_speaker.assert_called_once_with(audio_data)
 
 
 def test_process_voice_interaction_continues_when_speaker_accepted(monkeypatch):
     accepting_speaker_service = Mock()
-    accepting_speaker_service.verify.return_value = SpeakerVerificationResult(
-        is_match=True, similarity=0.912, threshold=0.68
+    accepting_speaker_service.identify_speaker.return_value = SpeakerIdentificationResult(
+        is_match=True, similarity=0.912, threshold=0.68, user_id="primary_user"
     )
     worker = _build_worker(accepting_speaker_service)
 
@@ -396,7 +396,7 @@ def test_process_voice_interaction_continues_when_speaker_accepted(monkeypatch):
         "analyze_voice_intent",
         lambda text: (TriggerType.VOICE_CHAT.value, False),
     )
-    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text: "")
+    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text, user_id: "")
     monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", Mock())
     monkeypatch.setattr(ai_worker_module, "insert_interaction_log", Mock())
 
@@ -404,12 +404,12 @@ def test_process_voice_interaction_continues_when_speaker_accepted(monkeypatch):
 
     assert action is not None
     assert action.speech == "테스트 응답"
-    accepting_speaker_service.verify.assert_called_once()
+    accepting_speaker_service.identify_speaker.assert_called_once()
 
 
 def test_process_voice_interaction_prints_actual_similarity_score_on_block(monkeypatch, capsys):
     rejecting_speaker_service = Mock()
-    rejecting_speaker_service.verify.return_value = SpeakerVerificationResult(
+    rejecting_speaker_service.identify_speaker.return_value = SpeakerIdentificationResult(
         is_match=False, similarity=0.412, threshold=0.68
     )
     worker = _build_worker(rejecting_speaker_service)
@@ -417,15 +417,15 @@ def test_process_voice_interaction_prints_actual_similarity_score_on_block(monke
     worker.process_voice_interaction(audio_data=np.zeros(32000, dtype=np.float32))
 
     captured = capsys.readouterr()
-    assert "화자 검증 점수" in captured.out
+    assert "화자 식별 점수" in captured.out
     assert "0.412" in captured.out
     assert "0.68" in captured.out
 
 
 def test_process_voice_interaction_prints_actual_similarity_score_on_pass(monkeypatch, capsys):
     accepting_speaker_service = Mock()
-    accepting_speaker_service.verify.return_value = SpeakerVerificationResult(
-        is_match=True, similarity=0.912, threshold=0.68
+    accepting_speaker_service.identify_speaker.return_value = SpeakerIdentificationResult(
+        is_match=True, similarity=0.912, threshold=0.68, user_id="primary_user"
     )
     worker = _build_worker(accepting_speaker_service)
 
@@ -435,21 +435,23 @@ def test_process_voice_interaction_prints_actual_similarity_score_on_pass(monkey
         "analyze_voice_intent",
         lambda text: (TriggerType.VOICE_CHAT.value, False),
     )
-    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text: "")
+    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text, user_id: "")
     monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", Mock())
     monkeypatch.setattr(ai_worker_module, "insert_interaction_log", Mock())
 
     worker.process_voice_interaction(audio_data=np.zeros(32000, dtype=np.float32))
 
     captured = capsys.readouterr()
-    assert "화자 검증 점수" in captured.out
+    assert "화자 식별 점수" in captured.out
     assert "0.912" in captured.out
 
 
 def test_process_voice_interaction_skips_score_print_when_verification_skipped(monkeypatch, capsys):
     """미등록/비활성화로 skipped=True인 경우 similarity가 없어 점수 출력 없이 조용히 통과해야 한다."""
     skipping_speaker_service = Mock()
-    skipping_speaker_service.verify.return_value = SpeakerVerificationResult(is_match=True, skipped=True)
+    skipping_speaker_service.identify_speaker.return_value = SpeakerIdentificationResult(
+        is_match=True, skipped=True, user_id="primary_user"
+    )
     worker = _build_worker(skipping_speaker_service)
 
     monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "안녕")
@@ -458,7 +460,7 @@ def test_process_voice_interaction_skips_score_print_when_verification_skipped(m
         "analyze_voice_intent",
         lambda text: (TriggerType.VOICE_CHAT.value, False),
     )
-    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text: "")
+    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text, user_id: "")
     monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", Mock())
     monkeypatch.setattr(ai_worker_module, "insert_interaction_log", Mock())
 
@@ -466,7 +468,7 @@ def test_process_voice_interaction_skips_score_print_when_verification_skipped(m
 
     assert action is not None
     captured = capsys.readouterr()
-    assert "화자 검증 점수" not in captured.out
+    assert "화자 식별 점수" not in captured.out
 
 
 def test_default_ai_worker_uses_global_speaker_service_singleton():

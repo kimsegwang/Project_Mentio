@@ -16,6 +16,7 @@ import pytest
 import server.workers.ai_worker as ai_worker_module
 from server.schemas.action import EmotionType, LLMResponse, TriggerType
 from server.schemas.memory import MemoryRecord, UserProfileSummary
+from server.schemas.speaker import SpeakerIdentificationResult
 from server.workers.ai_worker import AIWorker
 
 
@@ -52,6 +53,15 @@ def worker(monkeypatch) -> AIWorker:
     # 기존 RAG 테스트들이 실제 DB 조회를 타지 않도록 한다. 주입 자체를 검증하는 테스트는
     # 각 테스트 본문에서 이 기본값을 개별적으로 override한다.
     monkeypatch.setattr(ai_worker_module, "get_profile_summary", lambda *args, **kwargs: None)
+    # [다중 사용자 식별] 화자 식별 자체를 검증하지 않는 기존 RAG 테스트들이 실제 DB를 타지
+    # 않도록, 전역 speaker_service 싱글톤의 identify_speaker를 스킵(기본 사용자로 통과) 처리한다.
+    monkeypatch.setattr(
+        ai_worker_module.speaker_service,
+        "identify_speaker",
+        lambda *args, **kwargs: SpeakerIdentificationResult(
+            is_match=True, skipped=True, user_id=ai_worker_module.settings.DEFAULT_USER_ID
+        ),
+    )
     return w
 
 
@@ -62,7 +72,7 @@ def test_retrieve_memory_context_formats_topk_as_reference_lines(worker, monkeyp
     monkeypatch.setattr(
         ai_worker_module,
         "search_similar_memories",
-        lambda embedding, top_k, threshold: [
+        lambda embedding, user_id, top_k, threshold: [
             MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
             MemoryRecord(id=2, user_id="primary_user", fact_text="매일 아침 산책한다", similarity=0.8),
         ],
@@ -76,7 +86,7 @@ def test_retrieve_memory_context_formats_topk_as_reference_lines(worker, monkeyp
 def test_retrieve_memory_context_returns_empty_when_no_hits(worker, monkeypatch):
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
     monkeypatch.setattr(
-        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+        ai_worker_module, "search_similar_memories", lambda embedding, user_id, top_k, threshold: []
     )
 
     assert worker._retrieve_memory_context("아무 상관 없는 발화") == ""
@@ -87,7 +97,7 @@ def test_retrieve_memory_context_prints_similarity_score_per_memory(worker, monk
     monkeypatch.setattr(
         ai_worker_module,
         "search_similar_memories",
-        lambda embedding, top_k, threshold: [
+        lambda embedding, user_id, top_k, threshold: [
             MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.912345),
         ],
     )
@@ -104,7 +114,7 @@ def test_retrieve_memory_context_prints_similarity_score_per_memory(worker, monk
 def test_retrieve_memory_context_prints_skip_message_when_no_hits(worker, monkeypatch, capsys):
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
     monkeypatch.setattr(
-        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+        ai_worker_module, "search_similar_memories", lambda embedding, user_id, top_k, threshold: []
     )
 
     worker._retrieve_memory_context("아무 상관 없는 발화")
@@ -121,7 +131,7 @@ def test_retrieve_memory_context_uses_relaxed_threshold_for_question(worker, mon
 
     captured_kwargs = {}
 
-    def fake_search(embedding, top_k, threshold):
+    def fake_search(embedding, user_id, top_k, threshold):
         captured_kwargs["threshold"] = threshold
         return []
 
@@ -137,7 +147,7 @@ def test_retrieve_memory_context_uses_default_threshold_for_statement(worker, mo
 
     captured_kwargs = {}
 
-    def fake_search(embedding, top_k, threshold):
+    def fake_search(embedding, user_id, top_k, threshold):
         captured_kwargs["threshold"] = threshold
         return []
 
@@ -151,7 +161,7 @@ def test_retrieve_memory_context_uses_default_threshold_for_statement(worker, mo
 def test_retrieve_memory_context_logs_relaxed_threshold_for_question(worker, monkeypatch, capsys):
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
     monkeypatch.setattr(
-        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+        ai_worker_module, "search_similar_memories", lambda embedding, user_id, top_k, threshold: []
     )
 
     worker._retrieve_memory_context("내가 무슨 과일 좋아한다고 했지?")
@@ -184,7 +194,7 @@ def test_retrieve_memory_context_prepends_profile_summary_before_memories(worker
     monkeypatch.setattr(
         ai_worker_module,
         "search_similar_memories",
-        lambda embedding, top_k, threshold: [
+        lambda embedding, user_id, top_k, threshold: [
             MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
         ],
     )
@@ -206,7 +216,7 @@ def test_retrieve_memory_context_includes_profile_summary_even_without_topk_hits
     )
     monkeypatch.setattr(ai_worker_module.embedding_service, "embed", lambda text: [0.1] * 384)
     monkeypatch.setattr(
-        ai_worker_module, "search_similar_memories", lambda embedding, top_k, threshold: []
+        ai_worker_module, "search_similar_memories", lambda embedding, user_id, top_k, threshold: []
     )
 
     context = worker._retrieve_memory_context("아무 상관 없는 발화")
@@ -220,7 +230,7 @@ def test_retrieve_memory_context_omits_profile_line_when_no_summary_exists(worke
     monkeypatch.setattr(
         ai_worker_module,
         "search_similar_memories",
-        lambda embedding, top_k, threshold: [
+        lambda embedding, user_id, top_k, threshold: [
             MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
         ],
     )
@@ -240,7 +250,7 @@ def test_retrieve_memory_context_still_returns_memories_when_profile_lookup_fail
     monkeypatch.setattr(
         ai_worker_module,
         "search_similar_memories",
-        lambda embedding, top_k, threshold: [
+        lambda embedding, user_id, top_k, threshold: [
             MemoryRecord(id=1, user_id="primary_user", fact_text="커피를 좋아한다", similarity=0.9),
         ],
     )
@@ -290,7 +300,7 @@ def test_voice_chat_injects_memory_context_into_gemini_contents(worker, monkeypa
     monkeypatch.setattr(
         worker,
         "_retrieve_memory_context",
-        lambda user_text: "[참고 기억] 사용자는 커피를 좋아한다",
+        lambda user_text, user_id: "[참고 기억] 사용자는 커피를 좋아한다",
     )
 
     worker.process_voice_interaction(audio_data=b"dummy")
@@ -307,7 +317,7 @@ def test_voice_chat_triggers_background_storage_after_tts(worker, monkeypatch):
         "analyze_voice_intent",
         lambda text: (TriggerType.VOICE_CHAT.value, False),
     )
-    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text: "")
+    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text, user_id: "")
 
     submit_mock = Mock()
     monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", submit_mock)
@@ -316,7 +326,7 @@ def test_voice_chat_triggers_background_storage_after_tts(worker, monkeypatch):
 
     # MemoryWriteWorker의 순차 큐에 위임(submit)만 하고 즉시 반환되므로 대화 턴에는 지연이 없다.
     # 실제 extract_and_store 실행은 MemoryWriteWorker 자체의 단위 테스트에서 검증한다.
-    submit_mock.assert_called_once_with("내 이름은 김세강이야")
+    submit_mock.assert_called_once_with("내 이름은 김세강이야", user_id=ai_worker_module.settings.DEFAULT_USER_ID)
 
 
 def test_no_recognized_text_does_not_touch_rag_pipeline(worker, monkeypatch):
@@ -332,3 +342,74 @@ def test_no_recognized_text_does_not_touch_rag_pipeline(worker, monkeypatch):
     assert result is None
     search_mock.assert_not_called()
     submit_mock.assert_not_called()
+
+
+# --- [다중 사용자 격리] 식별된 화자의 user_id가 RAG/기억 적재까지 일관되게 전달되는지 ---
+
+def test_process_voice_interaction_threads_identified_user_id_into_rag_and_storage(worker, monkeypatch):
+    monkeypatch.setattr(
+        ai_worker_module.speaker_service,
+        "identify_speaker",
+        lambda *args, **kwargs: SpeakerIdentificationResult(
+            is_match=True, user_id="child_a", display_name="첫째", similarity=0.91, threshold=0.65
+        ),
+    )
+    monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "나 오늘 축구했어")
+    monkeypatch.setattr(
+        ai_worker_module.intent_service,
+        "analyze_voice_intent",
+        lambda text: (TriggerType.VOICE_CHAT.value, False),
+    )
+
+    retrieve_mock = Mock(return_value="")
+    monkeypatch.setattr(worker, "_retrieve_memory_context", retrieve_mock)
+    submit_mock = Mock()
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", submit_mock)
+
+    worker.process_voice_interaction(audio_data=b"dummy")
+
+    retrieve_mock.assert_called_once_with("나 오늘 축구했어", user_id="child_a")
+    submit_mock.assert_called_once_with("나 오늘 축구했어", user_id="child_a")
+
+
+def test_process_voice_interaction_blocks_when_speaker_unidentified(worker, monkeypatch):
+    """등록된 화자 중 누구와도 일치하지 않으면(미등록 화자) STT 이전 단계에서 조기 차단한다."""
+    monkeypatch.setattr(
+        ai_worker_module.speaker_service,
+        "identify_speaker",
+        lambda *args, **kwargs: SpeakerIdentificationResult(is_match=False, similarity=0.2, threshold=0.65),
+    )
+    stt_mock = Mock()
+    monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", stt_mock)
+
+    result = worker.process_voice_interaction(audio_data=b"dummy")
+
+    assert result is None
+    stt_mock.assert_not_called()
+
+
+def test_process_voice_interaction_falls_back_to_default_user_when_skipped(worker, monkeypatch):
+    """등록된 화자가 전무해 식별이 스킵되면 기존 단일 사용자 동작대로 DEFAULT_USER_ID로 처리한다."""
+    monkeypatch.setattr(
+        ai_worker_module.speaker_service,
+        "identify_speaker",
+        lambda *args, **kwargs: SpeakerIdentificationResult(
+            is_match=True, skipped=True, user_id=ai_worker_module.settings.DEFAULT_USER_ID
+        ),
+    )
+    monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "안녕")
+    monkeypatch.setattr(
+        ai_worker_module.intent_service,
+        "analyze_voice_intent",
+        lambda text: (TriggerType.VOICE_CHAT.value, False),
+    )
+
+    retrieve_mock = Mock(return_value="")
+    monkeypatch.setattr(worker, "_retrieve_memory_context", retrieve_mock)
+    submit_mock = Mock()
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", submit_mock)
+
+    worker.process_voice_interaction(audio_data=b"dummy")
+
+    retrieve_mock.assert_called_once_with("안녕", user_id=ai_worker_module.settings.DEFAULT_USER_ID)
+    submit_mock.assert_called_once_with("안녕", user_id=ai_worker_module.settings.DEFAULT_USER_ID)
