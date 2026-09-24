@@ -372,6 +372,49 @@ def test_process_voice_interaction_threads_identified_user_id_into_rag_and_stora
     submit_mock.assert_called_once_with("나 오늘 축구했어", user_id="child_a")
 
 
+def test_process_voice_interaction_passes_identified_display_name_to_brain_service(worker, monkeypatch):
+    """식별된 화자의 display_name이 BrainService.infer_action까지 전달되어 시스템 프롬프트에
+    바인딩될 수 있어야 한다 ([화자 페르소나 바인딩])."""
+    monkeypatch.setattr(
+        ai_worker_module.speaker_service,
+        "identify_speaker",
+        lambda *args, **kwargs: SpeakerIdentificationResult(
+            is_match=True, user_id="child_a", display_name="첫째", similarity=0.91, threshold=0.65
+        ),
+    )
+    monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "나 오늘 축구했어")
+    monkeypatch.setattr(
+        ai_worker_module.intent_service,
+        "analyze_voice_intent",
+        lambda text: (TriggerType.VOICE_CHAT.value, False),
+    )
+    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text, user_id: "")
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", Mock())
+
+    worker.process_voice_interaction(audio_data=b"dummy")
+
+    call_kwargs = worker.brain_service.infer_action.call_args.kwargs
+    assert call_kwargs["display_name"] == "첫째"
+
+
+def test_process_voice_interaction_passes_none_display_name_when_speaker_default(worker, monkeypatch):
+    """화자 식별이 스킵/기본 사용자로 판정된 경우에는 display_name=None이 전달되어,
+    BrainService 측 안전 폴백 문구가 사용되어야 한다."""
+    monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "안녕")
+    monkeypatch.setattr(
+        ai_worker_module.intent_service,
+        "analyze_voice_intent",
+        lambda text: (TriggerType.VOICE_CHAT.value, False),
+    )
+    monkeypatch.setattr(worker, "_retrieve_memory_context", lambda user_text, user_id: "")
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", Mock())
+
+    worker.process_voice_interaction(audio_data=b"dummy")
+
+    call_kwargs = worker.brain_service.infer_action.call_args.kwargs
+    assert call_kwargs["display_name"] is None
+
+
 def test_process_voice_interaction_blocks_when_speaker_unidentified(worker, monkeypatch):
     """등록된 화자 중 누구와도 일치하지 않으면(미등록 화자) STT 이전 단계에서 조기 차단한다."""
     monkeypatch.setattr(

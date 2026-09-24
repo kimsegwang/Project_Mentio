@@ -68,6 +68,74 @@ def test_extract_json_object_slices_outer_braces_only(service):
     assert service._extract_json_object(raw) == '{ "a": 1 }'
 
 
+# --- infer_action(): [화자 페르소나 바인딩] 식별된 display_name의 system_instruction 주입 ---
+
+def _fake_client_returning(text: str) -> Mock:
+    fake_response = Mock()
+    fake_response.text = text
+    fake_response.candidates = []
+    fake_client = Mock()
+    fake_client.models.generate_content.return_value = fake_response
+    return fake_client
+
+
+def test_infer_action_includes_display_name_in_system_instruction(service, monkeypatch):
+    fake_client = _fake_client_returning('{"emotion": "HAPPY", "speech": "안녕!"}')
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    service.infer_action(["안녕"], display_name="첫째")
+
+    call_kwargs = fake_client.models.generate_content.call_args.kwargs
+    system_instruction = call_kwargs["config"].system_instruction
+    assert "[현재 대화 상대]" in system_instruction
+    assert "이름: 첫째" in system_instruction
+
+
+def test_infer_action_uses_fallback_text_when_display_name_missing(service, monkeypatch):
+    fake_client = _fake_client_returning('{"emotion": "HAPPY", "speech": "안녕!"}')
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    service.infer_action(["안녕"], display_name=None)
+
+    call_kwargs = fake_client.models.generate_content.call_args.kwargs
+    system_instruction = call_kwargs["config"].system_instruction
+    assert "[현재 대화 상대]" in system_instruction
+    assert "이름이 확인되지 않은" in system_instruction
+    assert "이름:" not in system_instruction
+
+
+def test_infer_action_uses_fallback_text_when_display_name_blank(service, monkeypatch):
+    fake_client = _fake_client_returning('{"emotion": "HAPPY", "speech": "안녕!"}')
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    service.infer_action(["안녕"], display_name="   ")
+
+    call_kwargs = fake_client.models.generate_content.call_args.kwargs
+    assert "이름이 확인되지 않은" in call_kwargs["config"].system_instruction
+
+
+def test_infer_action_without_display_name_arg_defaults_to_fallback(service, monkeypatch):
+    """호출부가 display_name을 아예 넘기지 않는 기존 호출 경로(GESTURE/SNAPSHOT 등)도 회귀 없이 동작해야 한다."""
+    fake_client = _fake_client_returning('{"emotion": "HAPPY", "speech": "안녕!"}')
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    service.infer_action(["안녕"])
+
+    call_kwargs = fake_client.models.generate_content.call_args.kwargs
+    assert "이름이 확인되지 않은" in call_kwargs["config"].system_instruction
+
+
+def test_infer_action_keeps_thinking_budget_guardrail_with_persona_section(service, monkeypatch):
+    fake_client = _fake_client_returning('{"emotion": "HAPPY", "speech": "안녕!"}')
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    service.infer_action(["안녕"], display_name="첫째")
+
+    call_kwargs = fake_client.models.generate_content.call_args.kwargs
+    assert call_kwargs["config"].thinking_config.thinking_budget == 1
+    assert call_kwargs["config"].max_output_tokens >= 1024
+
+
 # --- classify_memory_relation(): 모순 판정 ---
 
 def test_classify_memory_relation_skips_llm_call_when_no_candidates(service, monkeypatch):
