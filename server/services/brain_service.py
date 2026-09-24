@@ -42,6 +42,22 @@ class BrainService:
             "반드시 영어 인사말, 생각(Thinking), 마크다운(```) 없이 오직 아래의 순수 단일 JSON 한 줄만 출력하라:\n"
             '{"emotion": "HAPPY", "speech": "안녕! 오늘 하루는 어땠어?"}'
         )
+        # [화자 페르소나 바인딩] 식별된 화자 이름 유무에 따라 매 턴 동적으로 system_instruction
+        # 끝에 덧붙는 섹션. self.system_instruction(공통 베이스)은 건드리지 않고 매 호출마다
+        # _build_system_instruction()에서 문자열을 조립해, 여러 화자가 번갈아 말해도 직전 화자의
+        # 이름이 다음 턴에 잘못 남는 상태 공유 버그를 방지한다.
+        self.speaker_persona_template = (
+            "\n\n[현재 대화 상대]\n"
+            "이름: {display_name}\n"
+            "위 이름을 자연스럽게 대화에 녹여 불러줘. 다만 매 문장마다 이름을 부르면 앵무새처럼 "
+            "부자연스러우니, 인사하거나 특별히 다정하게 강조하고 싶은 순간에만 이름을 사용하고 "
+            "나머지 문장에서는 이름을 생략한 채 자연스럽게 대화하라."
+        )
+        self.speaker_persona_fallback = (
+            "\n\n[현재 대화 상대]\n"
+            "아직 이름이 확인되지 않은 사용자야. 이름을 지어내거나 부르지 말고, "
+            "'너'처럼 일반적인 호칭으로 자연스럽게 대응하라."
+        )
         # RAG 장기 기억 모순 판정(Invalidation) 전용 system instruction.
         # infer_action의 감정/대사 추론과는 무관한 별도 목적이므로 프롬프트를 분리한다.
         self.conflict_system_instruction = (
@@ -122,13 +138,25 @@ class BrainService:
             logger.error(f"[BrainService Error] JSON 파싱 실패: {e} (Raw: {raw_text[:80]}...) -> Fallback 반환")
             return DEFAULT_LLM_FALLBACK
 
-    def infer_action(self, contents: List[Any]) -> LLMResponse:
+    def _build_system_instruction(self, display_name: Optional[str] = None) -> str:
+        """
+        [화자 페르소나 바인딩] 공통 베이스 system_instruction 뒤에 현재 대화 상대의
+        display_name 섹션을 덧붙인다. display_name이 없거나 공백이면(미등록/기본 사용자)
+        안전한 폴백 문구로 대체해, 로봇이 이름을 지어내 부르지 않도록 한다.
+        """
+        if display_name and display_name.strip():
+            persona_section = self.speaker_persona_template.format(display_name=display_name.strip())
+        else:
+            persona_section = self.speaker_persona_fallback
+        return self.system_instruction + persona_section
+
+    def infer_action(self, contents: List[Any], display_name: Optional[str] = None) -> LLMResponse:
         client = self.get_client()
 
         # ⚡ 400 에러 방어: thinking_budget=0 대신 정식 지원 옵션 적용
         # (SDK 버전에 따라 thinking_budget을 지원하지 않거나 0을 거부하는 현상 차단)
         config = types.GenerateContentConfig(
-            system_instruction=self.system_instruction,
+            system_instruction=self._build_system_instruction(display_name),
             response_mime_type="application/json",
             temperature=0.2,
             max_output_tokens=1024,

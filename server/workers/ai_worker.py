@@ -270,8 +270,12 @@ class AIWorker:
             contents.append(prompt_text)
 
             # 4. Gemini 추론
+            #    [화자 페르소나 바인딩] 식별된 화자의 display_name을 시스템 프롬프트에 함께 전달해,
+            #    로봇이 현재 대화 상대의 이름을 자연스럽게 부르며 반응하도록 한다.
             t2 = time.time()
-            llm_response: LLMResponse = self.brain_service.infer_action(contents)
+            llm_response: LLMResponse = self.brain_service.infer_action(
+                contents, display_name=identification.display_name
+            )
             gemini_latency = time.time() - t2
 
         total_latency = time.time() - total_start
