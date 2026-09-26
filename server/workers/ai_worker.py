@@ -16,6 +16,8 @@ from server.services.intent_service import intent_service
 from server.services.embedding_service import embedding_service
 from server.services.question_detector import question_detector
 from server.services.speaker_service import SpeakerService, speaker_service
+from server.services.voice_enrollment_service import VoiceEnrollmentService, voice_enrollment_service
+from server.schemas.speaker import EnrollmentReply
 from server.workers.memory_write_worker import memory_write_worker
 from server.services.tts_service import TTSService
 from server.services.audio_player_service import AudioPlayerService
@@ -31,12 +33,14 @@ class AIWorker:
         tts_service_instance: Optional[TTSService] = None,
         audio_player_instance: Optional[AudioSink] = None,
         speaker_service_instance: SpeakerService = speaker_service,
+        enrollment_service_instance: VoiceEnrollmentService = voice_enrollment_service,
         on_task_completed: Optional[callable] = None, # 💡 콜백 주입받기
     ):
         self.brain_service = brain_service_instance
         self.tts_service = tts_service_instance or TTSService()
         self.audio_player = audio_player_instance or AudioPlayerService()
         self.speaker_service = speaker_service_instance
+        self.enrollment_service = enrollment_service_instance
         self.on_task_completed = on_task_completed
 
         self.request_queue: queue.Queue[Tuple[str, str, List[Any], float]] = queue.Queue(maxsize=1)
@@ -198,12 +202,61 @@ class AIWorker:
                     self.on_task_completed()
                 self.request_queue.task_done()
 
+    def _deliver_enrollment_reply(
+        self, reply: EnrollmentReply, user_text: str, total_start: float
+    ) -> RobotAction:
+        """온보딩 안내 멘트를 RobotAction으로 조립해 UI 선반영 -> TTS 재생까지 수행한다.
+        온보딩 발화(이름/샘플 문장)는 사용자 기억이 아니므로 RAG 검색/장기 기억 적재는 하지 않는다."""
+        preset = get_preset_for_emotion(reply.emotion.value)
+        action = RobotAction(
+            emotion=reply.emotion,
+            speech=reply.speech,
+            led_rgb=preset["rgb"],
+            duration=preset["duration"]
+        )
+        total_latency = time.time() - total_start
+        trigger_str = TriggerType.VOICE_ENROLLMENT.value
+        print(f"🪪 [Voice Enrollment] 상태: {reply.state.value} | 발화: \"{user_text}\" ({total_latency:.2f}s)")
+
+        try:
+            insert_interaction_log(
+                trigger_type=trigger_str,
+                prompt=f"[음성 온보딩] ({reply.state.value}) \"{user_text}\"",
+                action=action,
+                latency_seconds=total_latency
+            )
+        except Exception as e:
+            print(f"[AIWorker DB Warning] 로그 적재 실패: {e}")
+
+        self.response_queue.put((action, trigger_str, total_latency))
+        if action.speech:
+            self._play_speech_and_guard(action.speech)
+        return action
+
+    def _process_enrollment_turn(
+        self, audio_data: Union[np.ndarray, bytes], total_start: float
+    ) -> Optional[RobotAction]:
+        """[온보딩 바이패스] 이름/목소리 샘플 대기 중인 턴을 처리한다. 신규 화자는 아직 DB에
+        없어 식별 임계값 미달로 차단되므로, 이 경로에서는 화자 식별 자체를 건너뛴다."""
+        print("🪪 [AIWorker] 음성 온보딩 진행 중 -> 화자 식별 차단 바이패스")
+        user_text = stt_service.transcribe(audio_data) or ""
+        print(f"\n🎤 [STT 인식 결과] \"{user_text}\"")
+
+        reply = self.enrollment_service.handle_turn(audio_data, user_text)
+        if reply is None:
+            return None
+        return self._deliver_enrollment_reply(reply, user_text, total_start)
+
     def process_voice_interaction(
-        self, 
-        audio_data: Union[np.ndarray, bytes], 
+        self,
+        audio_data: Union[np.ndarray, bytes],
         current_frame: Optional[Any] = None
     ) -> Optional[RobotAction]:
         total_start = time.time()
+
+        # [온보딩 바이패스] 음성 온보딩 진행 중(세션 타임아웃 이내)이면 화자 식별 없이 온보딩 턴으로 처리
+        if self.enrollment_service.is_active():
+            return self._process_enrollment_turn(audio_data, total_start)
 
         # 0. 화자 식별 (VAD 직후, STT 이전) - 미등록 화자 전무/비활성화 시 자동 스킵(DEFAULT_USER_ID로 통과)
         #    [다중 사용자 격리] 여기서 판정된 user_id가 이후 RAG 검색/프로필 조회/장기 기억
@@ -231,6 +284,12 @@ class AIWorker:
             return None
 
         print(f"\n🎤 [STT 인식 결과] \"{user_text}\" (소요: {stt_latency:.2f}s)")
+
+        # 1-1. [음성 온보딩] 등록 요청 발화는 일반 의도 판별 이전에 온보딩 세션을 시작한다.
+        #      식별을 통과한 화자(또는 등록 화자가 전무한 최초 상태)만 온보딩을 시작할 수 있어,
+        #      제3자/TV 소리가 스스로 온보딩을 열어 차단을 우회하지 못한다.
+        if self.enrollment_service.is_enrollment_request(user_text):
+            return self._deliver_enrollment_reply(self.enrollment_service.start(), user_text, total_start)
 
         # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION vs VOICE_TIME_RULE)
         t1 = time.time()

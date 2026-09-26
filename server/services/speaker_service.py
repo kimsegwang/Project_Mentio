@@ -124,8 +124,8 @@ class SpeakerService:
         return float(np.dot(a, b) / denom)
 
     @staticmethod
-    def _audio_duration_sec(audio: Union[np.ndarray, bytes], sample_rate: int) -> float:
-        """검증 대상 오디오의 길이(초)를 계산한다. 짧은 발화 완화 임계값 판단에 사용."""
+    def audio_duration_sec(audio: Union[np.ndarray, bytes], sample_rate: int = 16000) -> float:
+        """오디오의 길이(초)를 계산한다. 짧은 발화 완화 임계값 판단 및 온보딩 샘플 길이 검사에 사용."""
         if sample_rate <= 0:
             return 0.0
         num_samples = (len(audio) // 2) if isinstance(audio, bytes) else len(audio)
@@ -181,7 +181,7 @@ class SpeakerService:
             logger.info("[SpeakerService] 기준 화자 임베딩 미등록 상태 -> 검증 스킵")
             return SpeakerVerificationResult(is_match=True, skipped=True)
 
-        duration_sec = self._audio_duration_sec(audio, sample_rate)
+        duration_sec = self.audio_duration_sec(audio, sample_rate)
         is_short_utterance = duration_sec <= settings.SPEAKER_SHORT_UTTERANCE_MAX_SEC
         threshold = (
             settings.SPEAKER_SHORT_UTTERANCE_THRESHOLD
@@ -238,6 +238,17 @@ class SpeakerService:
             self._profiles_loaded = False
             self._active_profiles = None
 
+    def anchor_session_speaker(self, user_id: str, display_name: Optional[str]) -> None:
+        """
+        [대화형 온보딩] 방금 등록을 마친 화자를 세션 소프트패스의 기준 화자로 지정한다.
+        온보딩 중에는 identify_speaker()를 바이패스하므로 소프트패스 기준이 여전히 등록을
+        요청했던 기존 화자로 남아 있을 수 있다. 이 상태로 신규 화자가 곧바로 짧게 말하면
+        기존 화자로 잘못 귀속(기억 오염)될 수 있으므로, 등록 직후 신규 화자로 명시 갱신한다.
+        """
+        self._last_passed_monotonic = time.monotonic()
+        self._last_passed_user_id = user_id
+        self._last_passed_display_name = display_name
+
     def has_enrolled_speakers(self) -> bool:
         """1:N 식별 대상으로 등록된 활성 화자가 한 명이라도 있는지 여부."""
         return len(self._load_active_profiles()) > 0
@@ -266,7 +277,7 @@ class SpeakerService:
             logger.info("[SpeakerService] 등록된 화자 프로필 없음 -> 식별 스킵")
             return SpeakerIdentificationResult(is_match=True, skipped=True, user_id=settings.DEFAULT_USER_ID)
 
-        duration_sec = self._audio_duration_sec(audio, sample_rate)
+        duration_sec = self.audio_duration_sec(audio, sample_rate)
         is_short_utterance = duration_sec <= settings.SPEAKER_SHORT_UTTERANCE_MAX_SEC
         threshold = (
             settings.SPEAKER_SHORT_UTTERANCE_THRESHOLD

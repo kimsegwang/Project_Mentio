@@ -118,6 +118,16 @@ SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC = 10.0
 # 간주해 소프트패스로 통과시킨다. 연속 대화 중 짧은 맞장구("어", "음")로 인해 정상 사용자의
 # 세션이 중간에 끊기는 것을 방지하기 위함이다.
 
+# --- 대화형 음성 온보딩(Conversational Voice Enrollment) 설정 ---
+SPEAKER_ENROLLMENT_SESSION_TIMEOUT_SEC = 30.0
+# 온보딩 진행 중(이름/목소리 샘플 대기) 마지막 안내 이후 이 시간(초) 동안 응답이 없으면 세션을
+# 자동 만료(IDLE 복귀)한다. 온보딩 중에는 화자 식별 차단(Fail-Close)을 바이패스하므로, 세션이
+# 무기한 열려 있으면 제3자/TV 소리가 차단 없이 파이프라인에 진입할 수 있어 반드시 시간 제한을 둔다.
+
+SPEAKER_ENROLLMENT_MIN_SAMPLE_SEC = 1.5
+# 목소리 샘플로 인정하는 최소 발화 길이(초). 너무 짧은 발화는 Resemblyzer가 화자 특징을 충분히
+# 추출하지 못해(SPEAKER_SHORT_UTTERANCE_MAX_SEC 참고) 등록 후 식별 정확도가 떨어지므로 재요청한다.
+
 # --- 다중 사용자 화자 식별(Multi-user Speaker Identification) 설정 ---
 SPEAKER_EMBEDDING_DIM = 256
 # Resemblyzer VoiceEncoder.embed_utterance()가 반환하는 d-vector 차원(고정값).
