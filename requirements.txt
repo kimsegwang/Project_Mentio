@@ -28,5 +28,9 @@ resemblyzer>=0.1.4
 edge-tts>=6.1.0
 pygame>=2.5.0
 
+# --- 관리 대시보드 (web/app.py) ---
+# streamlit 1.42+는 protobuf>=5를 요구해 mediapipe 0.10.14(protobuf<5)와 충돌하므로 1.41 계열로 고정
+streamlit>=1.36,<1.42
+
 # --- 테스트 및 유틸리티 ---
 pytest>=7.4.0

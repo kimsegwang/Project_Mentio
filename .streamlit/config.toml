@@ -1,0 +1,8 @@
+# 멘티오 관리 대시보드(web/app.py) Streamlit 설정 — 프로젝트 루트에서 `streamlit run web/app.py` 실행 시 적용
+[client]
+# 개발자용 툴바 메뉴(⋮)와 Deploy 버튼을 숨긴다
+toolbarMode = "minimal"
+
+[browser]
+# 사용 통계 전송 비활성화
+gatherUsageStats = false
