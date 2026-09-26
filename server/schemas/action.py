@@ -9,6 +9,7 @@ class TriggerType(str, Enum):
     VOICE_CHAT = "VOICE_CHAT"
     VOICE_VISION = "VOICE_VISION"
     VOICE_TIME_RULE = "VOICE_TIME_RULE"
+    VOICE_ENROLLMENT = "VOICE_ENROLLMENT"
 
 
 class EmotionType(str, Enum):

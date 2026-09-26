@@ -3,9 +3,12 @@ server/schemas/speaker.py
 화자 검증(Speaker Verification) / 화자 식별(Speaker Identification) 결과 DTO.
 """
 from datetime import datetime
+from enum import Enum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
+
+from server.schemas.action import EmotionType
 
 # 화자 임베딩 벡터 타입 별칭 (Resemblyzer d-vector 기준 256차원)
 SpeakerEmbeddingVector = List[float]
@@ -23,6 +26,27 @@ class SpeakerVerificationResult(BaseModel):
     threshold: Optional[float] = Field(default=None, description="이번 판정에 실제 적용된 임계값 (검증 자체를 스킵한 경우 None)")
     skipped: bool = Field(default=False, description="비활성화 플래그 또는 기준 임베딩 미등록으로 검증 자체를 스킵했는지 여부")
     soft_passed: bool = Field(default=False, description="임계값 미달이지만 세션 소프트패스(최근 통과 이력)로 통과 처리되었는지 여부")
+
+
+class EnrollmentState(str, Enum):
+    """대화형 음성 온보딩(VoiceEnrollmentService) 상태."""
+
+    IDLE = "IDLE"
+    WAITING_FOR_NAME = "WAITING_FOR_NAME"
+    WAITING_FOR_VOICE_SAMPLE = "WAITING_FOR_VOICE_SAMPLE"
+
+
+class EnrollmentReply(BaseModel):
+    """
+    온보딩 한 턴의 처리 결과. AIWorker가 이를 RobotAction으로 조립해 표정/LED/TTS로 안내한다.
+    """
+
+    speech: str = Field(description="TTS로 출력할 안내 멘트")
+    emotion: EmotionType = Field(default=EmotionType.HAPPY, description="안내 멘트와 함께 표시할 감정")
+    state: EnrollmentState = Field(description="이번 턴 처리 후의 온보딩 상태")
+    completed: bool = Field(default=False, description="이번 턴에서 화자 등록이 최종 완료되었는지 여부")
+    user_id: Optional[str] = Field(default=None, description="등록 완료 시 신규 발급된 user_id")
+    display_name: Optional[str] = Field(default=None, description="등록 완료 시 저장된 표시 이름")
 
 
 class SpeakerProfile(BaseModel):
