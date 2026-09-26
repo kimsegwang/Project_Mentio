@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pgvector.psycopg2 import register_vector
 
@@ -174,3 +174,48 @@ def get_profile_summary(user_id: str = settings.DEFAULT_USER_ID) -> Optional[Use
     except Exception as e:
         logger.error(f"[MemoryRepository Error] 프로필 요약 조회 실패: {e}")
         return None
+
+
+# --- [Admin Dashboard] web/app.py 전용 조회/관리 메서드 ---
+
+
+def count_active_memories_by_user() -> Dict[str, int]:
+    """대시보드 개요/사용자 목록용: user_id별 활성(is_active=TRUE) 기억 개수."""
+    query = """
+        SELECT user_id, COUNT(*)
+        FROM user_long_term_memory
+        WHERE is_active = TRUE
+        GROUP BY user_id;
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                return {row[0]: int(row[1]) for row in cursor.fetchall()}
+    except Exception as e:
+        logger.error(f"[MemoryRepository Error] 사용자별 기억 개수 조회 실패: {e}")
+        return {}
+
+
+def soft_delete_memory(memory_id: int) -> bool:
+    """
+    대시보드에서 잘못 적재된 기억 한 건을 삭제 처리한다.
+    ⚠️ 물리 DELETE 금지 원칙에 따라 is_active=FALSE로만 비활성화한다 (superseded_by는 비워 둬
+       모순 해결로 대체된 기억과 수동 삭제된 기억을 구분). 이미 비활성인 행이면 False.
+    """
+    query = """
+        UPDATE user_long_term_memory
+        SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s AND is_active = TRUE;
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (memory_id,))
+                updated = cursor.rowcount > 0
+            conn.commit()
+            logger.info(f"[MemoryRepository] 기억 수동 삭제(비활성화) (id: {memory_id}, ok: {updated})")
+            return updated
+    except Exception as e:
+        logger.error(f"[MemoryRepository Error] 기억 수동 삭제 실패: {e}")
+        return False

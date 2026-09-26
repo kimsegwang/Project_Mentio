@@ -39,16 +39,21 @@ def close_db_pool() -> None:
 @contextmanager
 def get_db_connection() -> Generator[psycopg2.extensions.connection, None, None]:
     """커넥션 대여 및 작업 후 풀로 자동 반납하는 컨텍스트 매니저"""
-    if _db_pool is None:
-        init_db_pool()
+    # 대여한 풀을 지역 변수로 고정: 사용 중 close_db_pool()이 전역을 None으로 바꿔도(종료 신호 처리 등)
+    # 반납 대상이 바뀌지 않도록 한다.
+    db_pool = _db_pool if _db_pool is not None else init_db_pool()
 
-    conn = _db_pool.getconn()
+    conn = db_pool.getconn()
     try:
         yield conn
     except Exception:
         # 💡 실패한 트랜잭션 상태로 커넥션이 풀에 반납되면, 다음 대여자의 정상 쿼리까지
         #    InFailedSqlTransaction으로 연쇄 실패시키므로 반드시 롤백 후 반납한다.
-        conn.rollback()
+        #    (종료 중 closeall()로 이미 닫힌 커넥션은 롤백 대상이 없고, 롤백 시도 자체가 원래 예외를 가린다)
+        if not conn.closed:
+            conn.rollback()
         raise
     finally:
-        _db_pool.putconn(conn)
+        # 이미 closeall()된 풀에 putconn하면 PoolError가 발생하므로 열린 풀에만 반납한다.
+        if not db_pool.closed:
+            db_pool.putconn(conn)
