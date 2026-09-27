@@ -31,6 +31,9 @@ class FakeCursor:
     def fetchall(self):
         return self._rows
 
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
 
 class FakeConnection:
     def __init__(self, rows=None):
@@ -158,6 +161,32 @@ def test_get_active_speaker_embeddings_swallows_db_exception_and_returns_empty_l
     result = speaker_repository.get_active_speaker_embeddings()
 
     assert result == []
+
+
+# --- get_speaker_profiles_fingerprint(): Hot Reload 변경 지문 ---
+
+def test_get_speaker_profiles_fingerprint_returns_max_updated_at_and_counts(monkeypatch):
+    from datetime import datetime
+
+    updated_at = datetime(2026, 9, 28, 12, 0, 0)
+    fake_conn = _patch_db(monkeypatch, rows=[(updated_at, 3, 2)])
+
+    result = speaker_repository.get_speaker_profiles_fingerprint()
+
+    query = fake_conn.fake_cursor.executed_query
+    assert result == (updated_at, 3, 2)
+    assert "MAX(updated_at)" in query
+    assert "COUNT(*)" in query  # 물리 DELETE 감지용 행 수
+    assert "WHERE is_active" in query
+
+
+def test_get_speaker_profiles_fingerprint_swallows_db_exception_and_returns_none(monkeypatch):
+    def raise_error():
+        raise RuntimeError("db connection failed")
+
+    monkeypatch.setattr(speaker_repository, "get_db_connection", raise_error)
+
+    assert speaker_repository.get_speaker_profiles_fingerprint() is None
 
 
 # --- deactivate_speaker_profile(): 소프트 삭제 ---

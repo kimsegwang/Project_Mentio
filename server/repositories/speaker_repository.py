@@ -5,7 +5,7 @@ AI 추론/코사인 유사도 계산 등 도메인 로직은 포함하지 않고
 (1:N 유사도 비교 자체는 server/services/speaker_service.py에서 수행).
 """
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from pgvector.psycopg2 import register_vector
 
@@ -95,6 +95,30 @@ def get_active_speaker_embeddings() -> List[SpeakerEmbeddingRecord]:
     except Exception as e:
         logger.error(f"[SpeakerRepository Error] 활성 화자 프로필 목록 조회 실패: {e}")
         return []
+
+
+def get_speaker_profiles_fingerprint() -> Optional[Tuple]:
+    """
+    [Hot Reload] 화자 캐시 갱신 필요 여부를 판단하는 경량 변경 지문을 조회한다.
+    (MAX(updated_at), 전체 행 수, 활성 행 수) 튜플을 반환하며, 조회 실패 시 None.
+
+    대시보드의 물리 DELETE는 어떤 행의 updated_at도 올리지 않으므로 MAX(updated_at)만으로는
+    감지되지 않는다. 행 수를 함께 비교해 삭제까지 감지한다. 활성 행 수는 캐시 재적재 결과
+    검증(조회 실패로 빈 목록이 적재되는 것 방지)에도 쓰인다.
+    """
+    query = """
+        SELECT MAX(updated_at), COUNT(*), COUNT(*) FILTER (WHERE is_active)
+        FROM speaker_profiles;
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                row = cursor.fetchone()
+                return tuple(row) if row is not None else None
+    except Exception as e:
+        logger.error(f"[SpeakerRepository Error] 화자 프로필 변경 지문 조회 실패: {e}")
+        return None
 
 
 def deactivate_speaker_profile(user_id: str) -> None:

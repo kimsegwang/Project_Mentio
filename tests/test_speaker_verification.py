@@ -47,6 +47,13 @@ def _unit_vector(seed: int, dim: int = 256) -> np.ndarray:
     return v / np.linalg.norm(v)
 
 
+def _fake_embed(monkeypatch, service, fake_embed):
+    """전처리(무음 트리밍)를 항등 함수로 두고 임베딩 추론만 가짜로 대체한다.
+    따라서 테스트 오디오 길이가 곧 '트리밍 후 실제 발화 길이'로 간주된다."""
+    monkeypatch.setattr(service, "preprocess", lambda audio, sample_rate=16000: audio)
+    monkeypatch.setattr(service, "embed_preprocessed", fake_embed)
+
+
 @pytest.fixture()
 def service(tmp_path, monkeypatch):
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_VERIFICATION_ENABLED", True)
@@ -93,7 +100,7 @@ def test_verify_skips_when_disabled_flag(service, monkeypatch):
 
     # 비활성화 시에는 embed()가 아예 호출되지 않아야 한다 (임베딩 추론조차 스킵)
     embed_mock = Mock()
-    monkeypatch.setattr(service, "embed", embed_mock)
+    _fake_embed(monkeypatch, service,embed_mock)
 
     result = service.verify(np.zeros(32000, dtype=np.float32))
 
@@ -107,7 +114,7 @@ def test_verify_skips_when_disabled_flag(service, monkeypatch):
 def test_verify_passes_when_similarity_above_threshold(service, monkeypatch):
     reference = _unit_vector(1)
     np.save(service.reference_embedding_path, reference)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: reference)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: reference)
 
     result = service.verify(np.zeros(32000, dtype=np.float32))
 
@@ -119,7 +126,7 @@ def test_verify_blocks_when_similarity_below_threshold(service, monkeypatch):
     reference = _unit_vector(1)
     np.save(service.reference_embedding_path, reference)
     impostor = -reference  # 반대 방향 벡터 -> 코사인 유사도 -1.0 (명백히 임계값 미달)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: impostor)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: impostor)
 
     result = service.verify(np.zeros(32000, dtype=np.float32))
 
@@ -136,7 +143,7 @@ def test_verify_fails_open_when_embedding_extraction_raises(service, monkeypatch
     def raise_error(audio, sample_rate=16000):
         raise RuntimeError("resemblyzer backend error")
 
-    monkeypatch.setattr(service, "embed", raise_error)
+    _fake_embed(monkeypatch, service,raise_error)
 
     result = service.verify(np.zeros(32000, dtype=np.float32))
 
@@ -148,7 +155,7 @@ def test_verify_fails_open_when_embedding_extraction_raises(service, monkeypatch
 
 def test_reference_embedding_is_loaded_from_disk_only_once(service, monkeypatch):
     np.save(service.reference_embedding_path, REFERENCE_2D)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_2D.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_2D.copy())
 
     load_calls = []
     original_load = np.load
@@ -245,7 +252,7 @@ def test_short_utterance_uses_relaxed_threshold_instead_of_default(service, monk
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_MAX_SEC", 1.0)
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_THRESHOLD", 0.60)
     candidate = _candidate_at_similarity(0.65)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: candidate)
 
     short_audio = np.zeros(8000, dtype=np.float32)  # 16kHz 기준 0.5초 (짧은 발화)
     result = service.verify(short_audio, sample_rate=16000)
@@ -261,7 +268,7 @@ def test_long_utterance_still_uses_default_threshold(service, monkeypatch):
     np.save(service.reference_embedding_path, REFERENCE_2D)
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_MAX_SEC", 1.0)
     candidate = _candidate_at_similarity(0.65)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: candidate)
 
     long_audio = np.zeros(32000, dtype=np.float32)  # 16kHz 기준 2.0초 (짧은 발화 아님)
     result = service.verify(long_audio, sample_rate=16000)
@@ -276,7 +283,7 @@ def test_utterance_at_exact_boundary_is_treated_as_short(service, monkeypatch):
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_MAX_SEC", 1.0)
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_THRESHOLD", 0.60)
     candidate = _candidate_at_similarity(0.65)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: candidate)
 
     exact_1s_audio = np.zeros(16000, dtype=np.float32)  # 16kHz 기준 정확히 1.0초
     result = service.verify(exact_1s_audio, sample_rate=16000)
@@ -295,7 +302,7 @@ def test_session_soft_pass_allows_low_score_shortly_after_a_real_pass(service, m
     monkeypatch.setattr(speaker_service_module.time, "monotonic", lambda: fake_now["t"])
 
     # 1) 정상 통과 (임계값 이상)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_2D.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_2D.copy())
     first = service.verify(np.zeros(32000, dtype=np.float32))
     assert first.is_match is True
     assert first.soft_passed is False
@@ -303,7 +310,7 @@ def test_session_soft_pass_allows_low_score_shortly_after_a_real_pass(service, m
     # 2) 3초 후 임계값 미달 발화 -> 최근 통과 이력 덕분에 세션 소프트패스로 통과
     fake_now["t"] = 103.0
     low_score_candidate = _candidate_at_similarity(0.30)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: low_score_candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: low_score_candidate)
     second = service.verify(np.zeros(32000, dtype=np.float32))
 
     assert second.is_match is True
@@ -318,12 +325,12 @@ def test_session_soft_pass_expires_after_window(service, monkeypatch):
     fake_now = {"t": 200.0}
     monkeypatch.setattr(speaker_service_module.time, "monotonic", lambda: fake_now["t"])
 
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_2D.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_2D.copy())
     service.verify(np.zeros(32000, dtype=np.float32))
 
     fake_now["t"] = 215.0  # 15초 경과 -> 세션 윈도우 만료
     low_score_candidate = _candidate_at_similarity(0.30)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: low_score_candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: low_score_candidate)
     result = service.verify(np.zeros(32000, dtype=np.float32))
 
     assert result.is_match is False
@@ -333,7 +340,7 @@ def test_session_soft_pass_expires_after_window(service, monkeypatch):
 def test_verify_without_prior_pass_does_not_soft_pass(service, monkeypatch):
     np.save(service.reference_embedding_path, REFERENCE_2D)
     low_score_candidate = _candidate_at_similarity(0.30)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: low_score_candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: low_score_candidate)
 
     result = service.verify(np.zeros(32000, dtype=np.float32))
 

@@ -232,10 +232,19 @@ class VoiceEnrollmentService:
     def _handle_voice_sample(
         self, audio: Union[np.ndarray, bytes], name: str, sample_rate: int
     ) -> EnrollmentReply:
-        duration_sec = self.speaker_service.audio_duration_sec(audio, sample_rate)
-        if duration_sec < self.min_sample_sec:
+        # [실제 발화 길이 기준] 캡처 오디오에는 VAD 사전 버퍼/종료 무음(약 1.1초)이 포함되므로, 무음
+        # 트리밍 후 길이로 검사해야 실제 말한 부분이 짧은 부실 샘플이 기준 벡터로 등록되지 않는다.
+        # 트리밍 결과는 그대로 임베딩에 재사용하고, 길이 미달이면 모델 추론 없이 재요청한다.
+        try:
+            wav = self.speaker_service.preprocess(audio, sample_rate=sample_rate)
+            duration_sec = self.speaker_service.speech_duration_sec(wav)
+        except Exception as e:
+            logger.warning(f"[VoiceEnrollment] 목소리 샘플 전처리 중 예외 발생: {e}")
+            wav, duration_sec = None, None
+
+        if duration_sec is not None and duration_sec < self.min_sample_sec:
             logger.info(
-                f"[VoiceEnrollment] 샘플이 너무 짧음 ({duration_sec:.2f}s < {self.min_sample_sec:.2f}s) -> 재요청"
+                f"[VoiceEnrollment] 실제 발화가 너무 짧음 ({duration_sec:.2f}s < {self.min_sample_sec:.2f}s) -> 재요청"
             )
             with self._lock:
                 self._transition_locked(EnrollmentState.WAITING_FOR_VOICE_SAMPLE)
@@ -247,7 +256,9 @@ class VoiceEnrollmentService:
 
         user_id = self._generate_user_id()
         try:
-            embedding = self.speaker_service.embed(audio, sample_rate=sample_rate)
+            if wav is None:
+                raise RuntimeError("목소리 샘플 전처리 실패")
+            embedding = self.speaker_service.embed_preprocessed(wav)
             embedding_list = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
             success = upsert_speaker_profile(user_id=user_id, display_name=name, embedding=embedding_list)
         except Exception as e:

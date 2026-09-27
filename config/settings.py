@@ -103,7 +103,8 @@ SPEAKER_VERIFICATION_THRESHOLD = float(os.getenv("SPEAKER_VERIFICATION_THRESHOLD
 #     확보를 위해 0.65로 최종 하향함.
 
 SPEAKER_SHORT_UTTERANCE_MAX_SEC = 1.0
-# 이 길이(초) 이하의 발화는 "짧은 발화"로 간주해 SPEAKER_SHORT_UTTERANCE_THRESHOLD를 적용한다.
+# 무음 트리밍 후 실제 발화 길이(초)가 이 값 이하이면 "짧은 발화"로 간주해 SPEAKER_SHORT_UTTERANCE_THRESHOLD를
+# 적용한다. (캡처 오디오 전체 길이에는 VAD 사전 버퍼/종료 무음 약 1.1초가 포함되므로 기준으로 쓰지 않는다.)
 # Resemblyzer는 발화 길이가 짧을수록(예: "네", "응") 화자 특징을 충분히 추출하지 못해 동일
 # 화자의 발화조차 유사도 점수가 급락하는 경향이 실기 로그로 확인되었다.
 
@@ -125,10 +126,19 @@ SPEAKER_ENROLLMENT_SESSION_TIMEOUT_SEC = 30.0
 # 무기한 열려 있으면 제3자/TV 소리가 차단 없이 파이프라인에 진입할 수 있어 반드시 시간 제한을 둔다.
 
 SPEAKER_ENROLLMENT_MIN_SAMPLE_SEC = 1.5
-# 목소리 샘플로 인정하는 최소 발화 길이(초). 너무 짧은 발화는 Resemblyzer가 화자 특징을 충분히
+# 목소리 샘플로 인정하는 최소 발화 길이(초, 무음 트리밍 후 실제 발화 기준). 너무 짧은 발화는 Resemblyzer가 화자 특징을 충분히
 # 추출하지 못해(SPEAKER_SHORT_UTTERANCE_MAX_SEC 참고) 등록 후 식별 정확도가 떨어지므로 재요청한다.
 
 # --- 다중 사용자 화자 식별(Multi-user Speaker Identification) 설정 ---
 SPEAKER_EMBEDDING_DIM = 256
 # Resemblyzer VoiceEncoder.embed_utterance()가 반환하는 d-vector 차원(고정값).
 # speaker_profiles.speaker_embedding 컬럼의 VECTOR(256) 크기와 반드시 일치해야 한다.
+
+CAMERA_REOPEN_AFTER_FAILURES = 100
+# 메인 루프에서 카메라 프레임 읽기가 이 횟수만큼 연속 실패할 때마다 카메라를 다시 연다(약 3~4초 간격).
+# 실패 중에도 엔진은 종료되지 않고 음성 전용 모드로 계속 동작한다.
+
+SPEAKER_CACHE_POLL_INTERVAL_SEC = float(os.getenv("SPEAKER_CACHE_POLL_INTERVAL_SEC", "10"))
+# [Hot Reload] 대시보드 등 외부에서 speaker_profiles가 변경되었는지 확인하는 경량 폴링 주기(초).
+# 변경 지문(MAX(updated_at), 행 수)이 달라졌을 때만 화자 캐시를 재적재하며, 로봇이 발화 처리 중이거나
+# 음성 온보딩이 진행 중이면 다음 주기로 보류한다.
