@@ -49,8 +49,10 @@ def clock() -> FakeClock:
 @pytest.fixture()
 def fake_speaker_service() -> Mock:
     svc = Mock()
-    svc.audio_duration_sec.side_effect = SpeakerService.audio_duration_sec
-    svc.embed.return_value = NEW_SPEAKER_EMBEDDING
+    # 전처리(무음 트리밍)는 항등 함수로 두어, 테스트 오디오 길이 = 트리밍 후 실제 발화 길이로 간주한다
+    svc.preprocess.side_effect = lambda audio, sample_rate=16000: audio
+    svc.speech_duration_sec.side_effect = SpeakerService.speech_duration_sec
+    svc.embed_preprocessed.return_value = NEW_SPEAKER_EMBEDDING
     return svc
 
 
@@ -181,7 +183,7 @@ def test_short_voice_sample_re_requests_without_registering(enrollment, upsert_m
     assert reply.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
     assert reply.completed is False
     upsert_mock.assert_not_called()
-    fake_speaker_service.embed.assert_not_called()
+    fake_speaker_service.embed_preprocessed.assert_not_called()
 
 
 def test_voice_sample_registers_profile_and_invalidates_cache(enrollment, upsert_mock, fake_speaker_service):
@@ -196,7 +198,7 @@ def test_voice_sample_registers_profile_and_invalidates_cache(enrollment, upsert
     assert re.fullmatch(r"user_\d{14}", reply.user_id)
     assert reply.speech == "등록이 완료되었어요! 민수 님, 이제부터 목소리로 바로 알아볼게요."
 
-    fake_speaker_service.embed.assert_called_once()
+    fake_speaker_service.embed_preprocessed.assert_called_once()
     upsert_mock.assert_called_once_with(
         user_id=reply.user_id, display_name="민수", embedding=NEW_SPEAKER_EMBEDDING.tolist()
     )
@@ -219,7 +221,7 @@ def test_db_failure_resets_to_idle_without_cache_invalidation(enrollment, upsert
 
 
 def test_embedding_exception_is_handled_as_failure(enrollment, upsert_mock, fake_speaker_service):
-    fake_speaker_service.embed.side_effect = RuntimeError("resemblyzer backend error")
+    fake_speaker_service.embed_preprocessed.side_effect = RuntimeError("resemblyzer backend error")
     enrollment.start()
     enrollment.handle_turn(LONG_AUDIO, "민수")
 
@@ -403,9 +405,8 @@ def test_full_voice_onboarding_hot_reloads_new_speaker_for_next_turn(monkeypatch
 
     real_speaker_service = SpeakerService(similarity_threshold=0.65)
     current_voice = {"embedding": EXISTING_SPEAKER_EMBEDDING}
-    monkeypatch.setattr(
-        real_speaker_service, "embed", lambda audio, sample_rate=16000: current_voice["embedding"].copy()
-    )
+    monkeypatch.setattr(real_speaker_service, "preprocess", lambda audio, sample_rate=16000: audio)
+    monkeypatch.setattr(real_speaker_service, "embed_preprocessed", lambda wav: current_voice["embedding"].copy())
     enrollment = VoiceEnrollmentService(speaker_service_instance=real_speaker_service, clock=clock)
 
     mock_tts = Mock()
@@ -468,7 +469,8 @@ def test_anchor_session_speaker_sets_soft_pass_identity(monkeypatch):
     service = SpeakerService(similarity_threshold=0.65)
     service.anchor_session_speaker("user_new", "민수")
     # 두 후보 모두와 낮은 유사도의 짧은 맞장구 -> 소프트패스로 방금 등록한 신규 화자에게 귀속
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: np.array([-1.0, -1.0]))
+    monkeypatch.setattr(service, "preprocess", lambda audio, sample_rate=16000: audio)
+    monkeypatch.setattr(service, "embed_preprocessed", lambda wav: np.array([-1.0, -1.0]))
 
     result = service.identify_speaker(LONG_AUDIO)
 

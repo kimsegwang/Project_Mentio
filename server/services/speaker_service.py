@@ -22,7 +22,7 @@ import logging
 import os
 import threading
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -43,6 +43,9 @@ if not logger.handlers:
 
 
 class SpeakerService:
+    # Resemblyzer preprocess_wav()의 출력 샘플링 주파수 (resemblyzer.hparams.sampling_rate)
+    PREPROCESSED_SAMPLE_RATE = 16000
+
     def __init__(
         self,
         reference_embedding_path: str = None,
@@ -74,6 +77,10 @@ class SpeakerService:
         self._profiles_lock = threading.Lock()
         self._active_profiles: Optional[List] = None
         self._profiles_loaded = False
+        # [Hot Reload] reload_speaker_profiles() 호출마다 증가하는 세대 번호. 백그라운드 재적재
+        # (refresh_speaker_profiles) 도중 온보딩 완료 등으로 무효화가 끼어들면, 먼저 조회한
+        # 오래된 목록으로 캐시를 덮어쓰지 않도록 스왑 직전에 세대 번호를 비교한다.
+        self._profiles_generation = 0
 
     def _get_encoder(self):
         """Resemblyzer VoiceEncoder 지연 로딩 (최초 1회, Mutex로 중복 로딩 방지)"""
@@ -85,16 +92,43 @@ class SpeakerService:
                     self._encoder = VoiceEncoder("cpu")
         return self._encoder
 
-    def embed(self, audio: Union[np.ndarray, bytes], sample_rate: int = 16000) -> np.ndarray:
-        """16kHz 오디오(bytes 또는 float32 배열)를 화자 임베딩 벡터로 변환한다."""
+    def preprocess(self, audio: Union[np.ndarray, bytes], sample_rate: int = 16000) -> np.ndarray:
+        """
+        Resemblyzer 전처리(16kHz 리샘플 + 볼륨 정규화 + webrtcvad 무음 트리밍)를 적용한다.
+        반환 배열은 PREPROCESSED_SAMPLE_RATE 기준이며, 그 길이가 곧 실제 발화 길이다.
+        """
         from resemblyzer import preprocess_wav
 
         if isinstance(audio, bytes):
             audio = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
-        wav = preprocess_wav(audio, source_sr=sample_rate)
-        encoder = self._get_encoder()
-        return encoder.embed_utterance(wav)
+        return preprocess_wav(audio, source_sr=sample_rate)
+
+    def embed_preprocessed(self, wav: np.ndarray) -> np.ndarray:
+        """preprocess()를 거친 오디오를 화자 임베딩 벡터(L2 정규화)로 변환한다."""
+        return self._get_encoder().embed_utterance(wav)
+
+    def embed(self, audio: Union[np.ndarray, bytes], sample_rate: int = 16000) -> np.ndarray:
+        """16kHz 오디오(bytes 또는 float32 배열)를 화자 임베딩 벡터로 변환한다."""
+        return self.embed_preprocessed(self.preprocess(audio, sample_rate=sample_rate))
+
+    def embed_with_speech_duration(
+        self, audio: Union[np.ndarray, bytes], sample_rate: int = 16000
+    ) -> Tuple[np.ndarray, float]:
+        """
+        임베딩과 함께 무음 트리밍 후 실제 발화 길이(초)를 반환한다. 전처리를 한 번만 수행한다.
+
+        [실측 버그 수정] 캡처 오디오에는 VAD 사전 버퍼(약 0.27초)와 발화 종료 판정용 무음(0.8초 이상)이
+        항상 포함되어, 트리밍 전 길이로는 1초 이하가 될 수 없었다. 그 결과 짧은 발화 완화 임계값이
+        한 번도 적용되지 않았으므로(0.4초 발화 -> 1.47초로 측정), 판정은 반드시 이 값을 기준으로 한다.
+        """
+        wav = self.preprocess(audio, sample_rate=sample_rate)
+        return self.embed_preprocessed(wav), self.speech_duration_sec(wav)
+
+    @classmethod
+    def speech_duration_sec(cls, preprocessed_wav: np.ndarray) -> float:
+        """preprocess()를 거친(무음이 트리밍된) 오디오의 실제 발화 길이(초)."""
+        return len(preprocessed_wav) / cls.PREPROCESSED_SAMPLE_RATE
 
     @staticmethod
     def _coerce_to_float_array(value) -> np.ndarray:
@@ -125,7 +159,10 @@ class SpeakerService:
 
     @staticmethod
     def audio_duration_sec(audio: Union[np.ndarray, bytes], sample_rate: int = 16000) -> float:
-        """오디오의 길이(초)를 계산한다. 짧은 발화 완화 임계값 판단 및 온보딩 샘플 길이 검사에 사용."""
+        """
+        트리밍 전 캡처 오디오 전체 길이(초). VAD 사전 버퍼/종료 무음이 포함되므로 짧은 발화 판정이나
+        온보딩 샘플 길이 검사에는 쓰지 말고 speech_duration_sec()를 사용한다.
+        """
         if sample_rate <= 0:
             return 0.0
         num_samples = (len(audio) // 2) if isinstance(audio, bytes) else len(audio)
@@ -158,6 +195,13 @@ class SpeakerService:
         elapsed = time.monotonic() - self._last_passed_monotonic
         return elapsed <= settings.SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC
 
+    def _threshold_for_speech_duration(self, speech_sec: float) -> Tuple[float, bool]:
+        """실제 발화 길이(무음 트리밍 후)에 따른 (적용 임계값, 짧은 발화 여부)."""
+        is_short_utterance = speech_sec <= settings.SPEAKER_SHORT_UTTERANCE_MAX_SEC
+        if is_short_utterance:
+            return settings.SPEAKER_SHORT_UTTERANCE_THRESHOLD, True
+        return self.similarity_threshold, False
+
     def verify(self, audio: Union[np.ndarray, bytes], sample_rate: int = 16000) -> SpeakerVerificationResult:
         """
         VAD 직후 캡처된 발화 오디오가 기준 화자(primary_user)와 동일 인물인지 판정한다.
@@ -165,9 +209,9 @@ class SpeakerService:
         - 비활성화 플래그(SPEAKER_VERIFICATION_ENABLED=False) 또는 기준 임베딩 미등록 시:
           검증을 스킵하고 통과(is_match=True, skipped=True)를 반환해 파이프라인이 끊기지
           않도록 한다.
-        - 오디오 길이가 SPEAKER_SHORT_UTTERANCE_MAX_SEC 이하인 짧은 발화는 Resemblyzer
-          특징량 부족으로 점수가 급락하는 경향이 있어 완화된 SPEAKER_SHORT_UTTERANCE_THRESHOLD를
-          적용한다.
+        - 무음 트리밍 후 실제 발화 길이가 SPEAKER_SHORT_UTTERANCE_MAX_SEC 이하인 짧은 발화는
+          Resemblyzer 특징량 부족으로 점수가 급락하는 경향이 있어 완화된
+          SPEAKER_SHORT_UTTERANCE_THRESHOLD를 적용한다.
         - 임계값 미달이더라도 직전 통과로부터 SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC 이내라면
           같은 대화 세션이 이어지는 것으로 간주해 소프트패스로 통과시킨다.
         - 임베딩 추출/비교 중 예외가 발생해도 안전하게 통과로 폴백한다(가용성 우선).
@@ -181,16 +225,9 @@ class SpeakerService:
             logger.info("[SpeakerService] 기준 화자 임베딩 미등록 상태 -> 검증 스킵")
             return SpeakerVerificationResult(is_match=True, skipped=True)
 
-        duration_sec = self.audio_duration_sec(audio, sample_rate)
-        is_short_utterance = duration_sec <= settings.SPEAKER_SHORT_UTTERANCE_MAX_SEC
-        threshold = (
-            settings.SPEAKER_SHORT_UTTERANCE_THRESHOLD
-            if is_short_utterance
-            else self.similarity_threshold
-        )
-
         try:
-            candidate = self.embed(audio, sample_rate=sample_rate)
+            candidate, duration_sec = self.embed_with_speech_duration(audio, sample_rate=sample_rate)
+            threshold, is_short_utterance = self._threshold_for_speech_duration(duration_sec)
             similarity = self.cosine_similarity(candidate, reference)
             is_match = similarity >= threshold
             soft_passed = False
@@ -237,6 +274,56 @@ class SpeakerService:
         with self._profiles_lock:
             self._profiles_loaded = False
             self._active_profiles = None
+            self._profiles_generation += 1
+
+    def refresh_speaker_profiles(self, expected_active_count: Optional[int] = None) -> bool:
+        """
+        [Hot Reload] DB의 활성 화자 목록을 즉시 다시 조회해 캐시를 원자적으로 교체한다.
+        reload_speaker_profiles()(지연 무효화)와 달리 조회를 호출 스레드(백그라운드 폴러)에서
+        미리 끝내므로, 다음 발화의 identify_speaker()가 DB 조회 지연을 떠안지 않는다.
+
+        - expected_active_count가 주어졌는데 조회 결과 수와 다르면(조회 실패로 빈 목록 반환,
+          조회 도중 추가 변경 등) 캐시를 건드리지 않고 False를 반환한다. 빈 목록이 적재되면
+          화자 식별이 스킵(무검증 통과)되므로 반드시 막아야 한다.
+        - 조회 도중 reload_speaker_profiles()가 끼어들었으면 더 최신 상태를 덮어쓰지 않도록 포기한다.
+        - 세션 소프트패스 기준 화자가 비활성화/삭제되었으면 소프트패스를 해제하고, 호칭이
+          바뀌었으면 새 호칭으로 맞춘다.
+        """
+        with self._profiles_lock:
+            generation = self._profiles_generation
+
+        profiles = get_active_speaker_embeddings()
+        if expected_active_count is not None and len(profiles) != expected_active_count:
+            logger.warning(
+                f"[SpeakerService] 화자 프로필 재적재 결과 불일치 (조회 {len(profiles)}명, "
+                f"예상 {expected_active_count}명) -> 기존 캐시 유지"
+            )
+            return False
+
+        with self._profiles_lock:
+            if generation != self._profiles_generation:
+                logger.info("[SpeakerService] 재적재 중 캐시 무효화가 발생해 이번 결과는 폐기")
+                return False
+            self._active_profiles = profiles
+            self._profiles_loaded = True
+
+        self._reconcile_session_speaker(profiles)
+        logger.info(f"[SpeakerService] 화자 프로필 캐시 핫 리로드 완료 (활성 {len(profiles)}명)")
+        return True
+
+    def _reconcile_session_speaker(self, profiles: List) -> None:
+        """갱신된 프로필 기준으로 세션 소프트패스 기준 화자 정보를 정리한다."""
+        user_id = self._last_passed_user_id
+        if user_id is None:
+            return
+        matched = next((p for p in profiles if p.user_id == user_id), None)
+        if matched is None:
+            self._last_passed_monotonic = None
+            self._last_passed_user_id = None
+            self._last_passed_display_name = None
+            logger.info(f"[SpeakerService] 비활성화/삭제된 화자의 세션 소프트패스 해제 (user: {user_id})")
+        else:
+            self._last_passed_display_name = matched.display_name
 
     def anchor_session_speaker(self, user_id: str, display_name: Optional[str]) -> None:
         """
@@ -277,16 +364,9 @@ class SpeakerService:
             logger.info("[SpeakerService] 등록된 화자 프로필 없음 -> 식별 스킵")
             return SpeakerIdentificationResult(is_match=True, skipped=True, user_id=settings.DEFAULT_USER_ID)
 
-        duration_sec = self.audio_duration_sec(audio, sample_rate)
-        is_short_utterance = duration_sec <= settings.SPEAKER_SHORT_UTTERANCE_MAX_SEC
-        threshold = (
-            settings.SPEAKER_SHORT_UTTERANCE_THRESHOLD
-            if is_short_utterance
-            else self.similarity_threshold
-        )
-
         try:
-            candidate = self.embed(audio, sample_rate=sample_rate)
+            candidate, duration_sec = self.embed_with_speech_duration(audio, sample_rate=sample_rate)
+            threshold, is_short_utterance = self._threshold_for_speech_duration(duration_sec)
 
             best_profile = None
             best_similarity = -1.0

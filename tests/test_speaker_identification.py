@@ -37,6 +37,13 @@ def service(monkeypatch):
     return SpeakerService(similarity_threshold=0.65)
 
 
+def _fake_embed(monkeypatch, service, fake_embed):
+    """전처리(무음 트리밍)를 항등 함수로 두고 임베딩 추론만 가짜로 대체한다.
+    따라서 테스트 오디오 길이가 곧 '트리밍 후 실제 발화 길이'로 간주된다."""
+    monkeypatch.setattr(service, "preprocess", lambda audio, sample_rate=16000: audio)
+    monkeypatch.setattr(service, "embed_preprocessed", fake_embed)
+
+
 def _patch_profiles(monkeypatch, records):
     monkeypatch.setattr(speaker_service_module, "get_active_speaker_embeddings", lambda: records)
 
@@ -46,7 +53,7 @@ def _patch_profiles(monkeypatch, records):
 def test_identify_speaker_skips_when_disabled_flag(service, monkeypatch):
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_VERIFICATION_ENABLED", False)
     embed_mock = Mock()
-    monkeypatch.setattr(service, "embed", embed_mock)
+    _fake_embed(monkeypatch, service,embed_mock)
 
     result = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
@@ -59,7 +66,7 @@ def test_identify_speaker_skips_when_disabled_flag(service, monkeypatch):
 def test_identify_speaker_skips_when_no_profiles_enrolled(service, monkeypatch):
     _patch_profiles(monkeypatch, [])
     embed_mock = Mock()
-    monkeypatch.setattr(service, "embed", embed_mock)
+    _fake_embed(monkeypatch, service,embed_mock)
 
     result = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
@@ -77,7 +84,7 @@ def test_identify_speaker_matches_best_candidate_among_multiple_profiles(service
         SpeakerEmbeddingRecord(user_id="mom", display_name="엄마", embedding=REFERENCE_B.tolist()),
     ]
     _patch_profiles(monkeypatch, records)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_B.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_B.copy())
 
     result = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
@@ -94,7 +101,7 @@ def test_identify_speaker_blocks_unregistered_voice_below_threshold(service, mon
     ]
     _patch_profiles(monkeypatch, records)
     impostor = -REFERENCE_A  # 두 후보 모두와 낮은/음수 유사도
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: impostor)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: impostor)
 
     result = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
@@ -114,7 +121,7 @@ def test_identify_speaker_short_utterance_uses_relaxed_threshold(service, monkey
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_MAX_SEC", 1.0)
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_THRESHOLD", 0.60)
     candidate = _rotate(REFERENCE_A, 0.65)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: candidate)
 
     short_audio = np.zeros(8000, dtype=np.float32)  # 16kHz 기준 0.5초
     result = service.identify_speaker(short_audio, sample_rate=16000)
@@ -129,7 +136,7 @@ def test_identify_speaker_long_utterance_uses_default_threshold(service, monkeyp
     _patch_profiles(monkeypatch, records)
     monkeypatch.setattr(speaker_service_module.settings, "SPEAKER_SHORT_UTTERANCE_MAX_SEC", 1.0)
     candidate = _rotate(REFERENCE_A, 0.60)  # 짧은 발화 완화 임계값(0.60)이면 통과했을 값
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: candidate)
 
     long_audio = np.zeros(32000, dtype=np.float32)  # 2.0초
     result = service.identify_speaker(long_audio, sample_rate=16000)
@@ -153,7 +160,7 @@ def test_identify_speaker_session_soft_pass_retains_previously_passed_user(servi
     monkeypatch.setattr(speaker_service_module.time, "monotonic", lambda: fake_now["t"])
 
     # 1) "mom"이 정상 통과
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_B.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_B.copy())
     first = service.identify_speaker(np.zeros(32000, dtype=np.float32))
     assert first.is_match is True
     assert first.user_id == "mom"
@@ -161,7 +168,7 @@ def test_identify_speaker_session_soft_pass_retains_previously_passed_user(servi
     # 2) 3초 후 두 후보 모두와 낮은 유사도의 발화 -> 세션 소프트패스로 직전 화자(mom)에게 귀속
     fake_now["t"] = 103.0
     low_score_candidate = -REFERENCE_A  # dad(-1.0), mom(0.0) 모두 임계값 미달
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: low_score_candidate)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: low_score_candidate)
     second = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
     assert second.is_match is True
@@ -172,7 +179,7 @@ def test_identify_speaker_session_soft_pass_retains_previously_passed_user(servi
 def test_identify_speaker_without_prior_pass_does_not_soft_pass(service, monkeypatch):
     records = [SpeakerEmbeddingRecord(user_id="dad", display_name="아빠", embedding=REFERENCE_A.tolist())]
     _patch_profiles(monkeypatch, records)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: -REFERENCE_A)
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: -REFERENCE_A)
 
     result = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
@@ -189,7 +196,7 @@ def test_identify_speaker_fails_open_on_embedding_exception(service, monkeypatch
     def raise_error(audio, sample_rate=16000):
         raise RuntimeError("resemblyzer backend error")
 
-    monkeypatch.setattr(service, "embed", raise_error)
+    _fake_embed(monkeypatch, service,raise_error)
 
     result = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
@@ -245,7 +252,7 @@ def test_identify_speaker_handles_pgvector_like_embedding_from_db(service, monke
         SpeakerEmbeddingRecord(user_id="mom", display_name="엄마", embedding=FakePgvectorVector(REFERENCE_B.tolist())),
     ]
     _patch_profiles(monkeypatch, records)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_B.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_B.copy())
 
     result = service.identify_speaker(np.zeros(32000, dtype=np.float32))
 
@@ -266,7 +273,7 @@ def test_active_profiles_are_loaded_from_db_only_once(service, monkeypatch):
         return records
 
     monkeypatch.setattr(speaker_service_module, "get_active_speaker_embeddings", spy_load)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_A.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_A.copy())
 
     service.identify_speaker(np.zeros(32000, dtype=np.float32))
     service.identify_speaker(np.zeros(32000, dtype=np.float32))
@@ -282,7 +289,7 @@ def test_reload_speaker_profiles_invalidates_cache(service, monkeypatch):
         return [SpeakerEmbeddingRecord(user_id="dad", display_name="아빠", embedding=REFERENCE_A.tolist())]
 
     monkeypatch.setattr(speaker_service_module, "get_active_speaker_embeddings", spy_load)
-    monkeypatch.setattr(service, "embed", lambda audio, sample_rate=16000: REFERENCE_A.copy())
+    _fake_embed(monkeypatch, service,lambda audio, sample_rate=16000: REFERENCE_A.copy())
 
     service.identify_speaker(np.zeros(32000, dtype=np.float32))
     service.reload_speaker_profiles()
