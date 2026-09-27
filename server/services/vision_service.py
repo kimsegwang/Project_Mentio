@@ -1,7 +1,7 @@
 import cv2
 from PIL import Image
 from config import settings
-from tests.test_gesture import HeartDetector
+from server.services.gesture_detector import HeartDetector
 
 
 class VisionService:

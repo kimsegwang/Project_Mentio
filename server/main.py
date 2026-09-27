@@ -3,6 +3,7 @@ import sys
 import time
 import threading
 import cv2
+import numpy as np
 import pygame
 
 # 프로젝트 루트 경로 등록
@@ -18,6 +19,7 @@ from server.services.audio_listener_service import AudioListenerService
 from server.services.audio_player_service import AudioPlayerService
 from server.workers.ai_worker import AIWorker
 from server.workers.memory_write_worker import memory_write_worker
+from server.workers.speaker_cache_sync_worker import SpeakerCacheSyncWorker
 from server.repositories.preset_repository import get_preset_for_emotion
 
 # 전역 공유 상태 (스레드 동기화용)
@@ -35,6 +37,12 @@ def release_processing_lock():
     global is_processing
     with processing_lock:
         is_processing = False
+
+
+def is_robot_busy() -> bool:
+    """발화/제스처/스냅샷 처리 중 여부 (화자 캐시 핫 리로드 보류 판단용)"""
+    with processing_lock:
+        return is_processing
 
 
 def handle_voice_interaction_thread(ai_worker: AIWorker, audio_data, pil_snapshot):
@@ -115,6 +123,9 @@ def run_mentio_engine():
     )
     ai_worker.start()
     memory_write_worker.start()
+    # 💡 [Hot Reload] 대시보드의 화자 변경(호칭/활성/삭제)을 엔진 재기동 없이 반영하는 폴링 워커
+    speaker_cache_sync_worker = SpeakerCacheSyncWorker(is_busy=is_robot_busy)
+    speaker_cache_sync_worker.start()
 
     # 3. 비전 카메라 스트림 오픈
     cap = cv2.VideoCapture(settings.CAMERA_INDEX)
@@ -122,6 +133,7 @@ def run_mentio_engine():
         print(f"[Engine Error] 카메라(Index: {settings.CAMERA_INDEX})를 열 수 없습니다.")
         ai_worker.stop()
         memory_write_worker.stop()
+        speaker_cache_sync_worker.stop()
         close_db_pool()
         return
 
@@ -156,20 +168,45 @@ def run_mentio_engine():
     print(" - 's' 키: 수동 480p 스냅샷 VLM 분석")
     print(" - 'q' 키: 시스템 안전 종료\n")
 
+    # 💡 [카메라 장애 내성] 프레임 읽기 실패(다른 프로세스의 카메라 점유, 드라이버 일시 오류 등) 시
+    #    엔진 전체를 종료하지 않고 음성 대화는 계속 유지한다. 대체 화면을 띄워 'q' 키 입력을 계속 받고,
+    #    일정 횟수 연속 실패마다 카메라를 다시 연다.
+    camera_fail_count = 0
+    camera_placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(camera_placeholder, "CAMERA UNAVAILABLE (voice only)", (90, 240),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
     try:
         while True:
             ret, frame = cap.read()
-            if not ret:
-                break
-
-            # A. 최신 프레임 스냅샷 버퍼 갱신 (Thread-safe)
-            with frame_lock:
-                latest_frame = frame.copy()
-
+            camera_ok = bool(ret) and frame is not None
             current_time = time.time()
 
-            # B. 실시간 비전 처리 (30fps 무중단 제스처 감지)
-            frame, is_heart = vision_service.process_gesture(frame)
+            if camera_ok:
+                if camera_fail_count > 0:
+                    print("[Engine] 카메라 프레임 수신 복구 완료.")
+                camera_fail_count = 0
+
+                # A. 최신 프레임 스냅샷 버퍼 갱신 (Thread-safe)
+                with frame_lock:
+                    latest_frame = frame.copy()
+
+                # B. 실시간 비전 처리 (30fps 무중단 제스처 감지)
+                frame, is_heart = vision_service.process_gesture(frame)
+            else:
+                camera_fail_count += 1
+                if camera_fail_count == 1:
+                    print("[Engine Warning] 카메라 프레임을 읽을 수 없습니다 "
+                          "(다른 프로그램이 카메라를 사용 중인지 확인). 음성 전용 모드로 계속 동작합니다.")
+                    # 오래된 프레임이 VLM 스냅샷으로 쓰이지 않도록 비운다
+                    with frame_lock:
+                        latest_frame = None
+                if camera_fail_count % settings.CAMERA_REOPEN_AFTER_FAILURES == 0:
+                    cap.release()
+                    cap = cv2.VideoCapture(settings.CAMERA_INDEX)
+                frame = camera_placeholder.copy()
+                is_heart = False
+                time.sleep(0.03)  # 실패 시 CPU 공회전 방지
 
             # C. 제스처 트리거 검사
             if is_heart and (current_time - last_event_time > settings.COOLDOWN_SECONDS):
@@ -185,7 +222,7 @@ def run_mentio_engine():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('s') and (current_time - last_event_time > settings.COOLDOWN_SECONDS):
+            elif key == ord('s') and camera_ok and (current_time - last_event_time > settings.COOLDOWN_SECONDS):
                 with processing_lock:
                     if not is_processing:
                         is_processing = True
@@ -258,6 +295,8 @@ def run_mentio_engine():
 
             cv2.imshow(window_name, frame)
 
+    except KeyboardInterrupt:
+        print("\n[Engine] Ctrl+C 인터럽트 수신 -> 안전 종료를 진행합니다.")
     finally:
         # 안전한 자원 반납
         stop_event.set()
@@ -265,6 +304,7 @@ def run_mentio_engine():
         cv2.destroyAllWindows()
         ai_worker.stop()
         memory_write_worker.stop()
+        speaker_cache_sync_worker.stop()
         close_db_pool()
         print("[Shutdown] 모든 리소스(카메라, 스레드, 워커, DB 커넥션)가 안전하게 해제되었습니다.")
 
