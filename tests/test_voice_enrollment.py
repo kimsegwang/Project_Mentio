@@ -8,6 +8,8 @@ tests/test_voice_enrollment.py
 - 세션 타임아웃 만료(바이패스 창이 무기한 열려 있지 않음)
 - 화자 식별 차단(Fail-Close) 바이패스: 온보딩 중에만 identify_speaker를 건너뜀
 - 프로필 생성(upsert_speaker_profile) 및 캐시 무효화(Hot Reload)로 다음 턴부터 신규 화자 식별
+- 다중 발화 평균화: 이름 발화 + 샘플 2개 임베딩 평균 후 L2 정규화
+- 중복/유사 화자 등록 방지: 0.85 이상 기존 프로필 갱신 / 0.75~0.85 경고 후 신규 등록 / 미만 정상 등록
 Resemblyzer 실제 모델/DB는 사용하지 않고 가짜 임베딩과 인메모리 프로필 목록으로 대체한다.
 """
 import re
@@ -29,6 +31,9 @@ from server.workers.ai_worker import AIWorker
 SAMPLE_RATE = 16000
 LONG_AUDIO = np.zeros(SAMPLE_RATE * 3, dtype=np.float32)  # 3.0초
 SHORT_AUDIO = np.zeros(SAMPLE_RATE // 2, dtype=np.float32)  # 0.5초
+NEAR_SILENT_AUDIO = np.zeros(SAMPLE_RATE // 5, dtype=np.float32)  # 0.2초 (이름 발화 평균 제외 기준 미만)
+SAMPLE_1 = "오늘 날씨가 정말 화창하고 좋네요"
+SAMPLE_2 = "주말에는 가족들과 함께 맛있는 저녁을 먹고 싶어요"
 NEW_SPEAKER_EMBEDDING = np.array([0.0, 1.0], dtype=np.float32)
 EXISTING_SPEAKER_EMBEDDING = np.array([1.0, 0.0], dtype=np.float32)
 
@@ -53,6 +58,7 @@ def fake_speaker_service() -> Mock:
     svc.preprocess.side_effect = lambda audio, sample_rate=16000: audio
     svc.speech_duration_sec.side_effect = SpeakerService.speech_duration_sec
     svc.embed_preprocessed.return_value = NEW_SPEAKER_EMBEDDING
+    svc.find_closest_profile.return_value = None  # 기본: 기존 활성 화자 없음
     return svc
 
 
@@ -160,7 +166,7 @@ def test_name_turn_transitions_to_waiting_for_voice_sample(enrollment):
     reply = enrollment.handle_turn(LONG_AUDIO, "저는 민수예요")
 
     assert reply.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
-    assert reply.speech == "민수 님 반가워요! '오늘 날씨가 참 좋다'처럼 평소 말투로 한 문장 말씀해 주세요."
+    assert reply.speech == f"민수 님 반가워요! 목소리를 잘 익힐 수 있게 평소 말투로 '{SAMPLE_1}'라고 말씀해 주세요."
     assert enrollment.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
 
 
@@ -177,28 +183,60 @@ def test_unrecognized_name_re_asks_and_stays_waiting_for_name(enrollment):
 def test_short_voice_sample_re_requests_without_registering(enrollment, upsert_mock, fake_speaker_service):
     enrollment.start()
     enrollment.handle_turn(LONG_AUDIO, "민수")
+    fake_speaker_service.embed_preprocessed.reset_mock()  # 이름 발화 임베딩 호출은 제외
 
     reply = enrollment.handle_turn(SHORT_AUDIO, "좋다")
 
     assert reply.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
     assert reply.completed is False
+    assert SAMPLE_1 in reply.speech
     upsert_mock.assert_not_called()
     fake_speaker_service.embed_preprocessed.assert_not_called()
+
+
+def test_first_sample_asks_for_second_sample_without_registering(enrollment, upsert_mock, fake_speaker_service):
+    enrollment.start()
+    enrollment.handle_turn(LONG_AUDIO, "민수")
+
+    reply = enrollment.handle_turn(LONG_AUDIO, SAMPLE_1)
+
+    assert reply.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
+    assert reply.completed is False
+    assert reply.speech == f"좋아요! 한 번 더, '{SAMPLE_2}'라고 말씀해 주세요."
+    upsert_mock.assert_not_called()
+    fake_speaker_service.find_closest_profile.assert_not_called()
+
+
+def test_short_second_sample_re_requests_second_sentence(enrollment, upsert_mock):
+    enrollment.start()
+    enrollment.handle_turn(LONG_AUDIO, "민수")
+    enrollment.handle_turn(LONG_AUDIO, SAMPLE_1)
+
+    reply = enrollment.handle_turn(SHORT_AUDIO, "주말에")
+
+    assert reply.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
+    assert SAMPLE_2 in reply.speech
+    upsert_mock.assert_not_called()
+    # 재시도 후 두 번째 샘플이 들어오면 정상 완료 (짧은 샘플은 개수에 포함되지 않음)
+    assert enrollment.handle_turn(LONG_AUDIO, SAMPLE_2).completed is True
 
 
 def test_voice_sample_registers_profile_and_invalidates_cache(enrollment, upsert_mock, fake_speaker_service):
     enrollment.start()
     enrollment.handle_turn(LONG_AUDIO, "민수")
+    enrollment.handle_turn(LONG_AUDIO, SAMPLE_1)
 
-    reply = enrollment.handle_turn(LONG_AUDIO, "오늘 날씨가 참 좋다")
+    reply = enrollment.handle_turn(LONG_AUDIO, SAMPLE_2)
 
     assert reply.completed is True
     assert reply.state == EnrollmentState.IDLE
     assert reply.display_name == "민수"
+    assert reply.updated_existing is False
+    assert reply.similar_to_user_id is None
     assert re.fullmatch(r"user_\d{14}", reply.user_id)
     assert reply.speech == "등록이 완료되었어요! 민수 님, 이제부터 목소리로 바로 알아볼게요."
 
-    fake_speaker_service.embed_preprocessed.assert_called_once()
+    assert fake_speaker_service.embed_preprocessed.call_count == 3  # 이름 + 샘플 2개
     upsert_mock.assert_called_once_with(
         user_id=reply.user_id, display_name="민수", embedding=NEW_SPEAKER_EMBEDDING.tolist()
     )
@@ -207,12 +245,157 @@ def test_voice_sample_registers_profile_and_invalidates_cache(enrollment, upsert
     assert enrollment.is_active() is False
 
 
+# --- 다중 발화 평균화 ---
+
+def _complete_onboarding(enrollment, name_audio=LONG_AUDIO):
+    enrollment.start()
+    enrollment.handle_turn(name_audio, "난 유미야")
+    enrollment.handle_turn(LONG_AUDIO, SAMPLE_1)
+    return enrollment.handle_turn(LONG_AUDIO, SAMPLE_2)
+
+
+def test_registers_l2_normalized_average_of_name_and_two_samples(enrollment, upsert_mock, fake_speaker_service):
+    name_emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    sample1_emb = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    sample2_emb = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    fake_speaker_service.embed_preprocessed.side_effect = [name_emb, sample1_emb, sample2_emb]
+
+    reply = _complete_onboarding(enrollment)
+
+    assert reply.completed is True
+    assert reply.display_name == "유미"
+    registered = np.array(upsert_mock.call_args.kwargs["embedding"])
+    np.testing.assert_allclose(registered, np.ones(3) / np.sqrt(3), rtol=1e-6)
+    assert np.linalg.norm(registered) == pytest.approx(1.0)
+
+
+def test_near_silent_name_utterance_is_excluded_from_average(enrollment, upsert_mock, fake_speaker_service):
+    sample1_emb = np.array([1.0, 0.0], dtype=np.float32)
+    sample2_emb = np.array([0.0, 1.0], dtype=np.float32)
+    fake_speaker_service.embed_preprocessed.side_effect = [sample1_emb, sample2_emb]
+
+    reply = _complete_onboarding(enrollment, name_audio=NEAR_SILENT_AUDIO)
+
+    assert reply.completed is True
+    assert fake_speaker_service.embed_preprocessed.call_count == 2  # 이름 발화는 임베딩하지 않음
+    registered = np.array(upsert_mock.call_args.kwargs["embedding"])
+    np.testing.assert_allclose(registered, np.array([1.0, 1.0]) / np.sqrt(2), rtol=1e-6)
+
+
+def test_name_embedding_failure_does_not_block_enrollment(enrollment, upsert_mock, fake_speaker_service):
+    fake_speaker_service.embed_preprocessed.side_effect = [
+        RuntimeError("name embed error"),
+        NEW_SPEAKER_EMBEDDING,
+        NEW_SPEAKER_EMBEDDING,
+    ]
+
+    reply = _complete_onboarding(enrollment)
+
+    assert reply.completed is True
+    upsert_mock.assert_called_once()
+
+
+def test_average_embeddings_returns_unit_norm_vector():
+    result = SpeakerService.average_embeddings([[3.0, 0.0], np.array([0.0, 4.0]), [1.0, 1.0]])
+
+    assert result.dtype == np.float32
+    assert np.linalg.norm(result) == pytest.approx(1.0)
+    np.testing.assert_allclose(result, np.array([4.0, 5.0]) / np.linalg.norm([4.0, 5.0]), rtol=1e-6)
+
+
+@pytest.mark.parametrize("embeddings", [[], [[1.0, 0.0], [-1.0, 0.0]]])
+def test_average_embeddings_rejects_empty_or_cancelling_inputs(embeddings):
+    with pytest.raises(ValueError):
+        SpeakerService.average_embeddings(embeddings)
+
+
+# --- 중복/유사 화자 등록 방지 ---
+
+DAD = SpeakerEmbeddingRecord(user_id="dad", display_name="아빠", embedding=EXISTING_SPEAKER_EMBEDDING.tolist())
+
+
+@pytest.mark.parametrize("similarity", [0.85, 0.93])
+def test_duplicate_speaker_updates_existing_profile_instead_of_new_user(
+    enrollment, upsert_mock, fake_speaker_service, similarity
+):
+    fake_speaker_service.find_closest_profile.return_value = (DAD, similarity)
+
+    reply = _complete_onboarding(enrollment)
+
+    assert reply.completed is True
+    assert reply.updated_existing is True
+    assert reply.user_id == "dad"
+    assert reply.display_name == "아빠"  # 응답한 이름("유미")으로 기존 호칭을 덮어쓰지 않음
+    assert reply.speech == "아빠 님 목소리는 이미 등록되어 있어서, 기존 목소리 정보를 새로 갱신했어요."
+    upsert_mock.assert_called_once_with(user_id="dad", display_name="아빠", embedding=NEW_SPEAKER_EMBEDDING.tolist())
+    fake_speaker_service.reload_speaker_profiles.assert_called_once()
+    fake_speaker_service.anchor_session_speaker.assert_called_once_with("dad", "아빠")
+
+
+@pytest.mark.parametrize("similarity", [0.75, 0.8, 0.849])
+def test_similar_speaker_registers_new_user_with_warning(
+    enrollment, upsert_mock, fake_speaker_service, similarity, caplog
+):
+    fake_speaker_service.find_closest_profile.return_value = (DAD, similarity)
+
+    with caplog.at_level("WARNING", logger=enrollment_module.logger.name):
+        reply = _complete_onboarding(enrollment)
+
+    assert reply.completed is True
+    assert reply.updated_existing is False
+    assert reply.similar_to_user_id == "dad"
+    assert reply.user_id != "dad"
+    assert reply.display_name == "유미"
+    assert reply.speech == "등록이 완료되었어요! 유미 님, 다만 아빠 님과 목소리가 많이 비슷해서 가끔 헷갈릴 수 있어요."
+    assert upsert_mock.call_args.kwargs["user_id"] == reply.user_id
+    assert "유사 화자 경계" in caplog.text
+
+
+def test_dissimilar_speaker_registers_normally(enrollment, upsert_mock, fake_speaker_service):
+    fake_speaker_service.find_closest_profile.return_value = (DAD, 0.749)
+
+    reply = _complete_onboarding(enrollment)
+
+    assert reply.completed is True
+    assert reply.updated_existing is False
+    assert reply.similar_to_user_id is None
+    assert reply.speech == "등록이 완료되었어요! 유미 님, 이제부터 목소리로 바로 알아볼게요."
+
+
+def test_duplicate_check_failure_falls_back_to_new_registration(enrollment, upsert_mock, fake_speaker_service):
+    fake_speaker_service.find_closest_profile.side_effect = RuntimeError("cache error")
+
+    reply = _complete_onboarding(enrollment)
+
+    assert reply.completed is True
+    assert reply.updated_existing is False
+    upsert_mock.assert_called_once()
+
+
+def test_find_closest_profile_returns_best_active_profile(monkeypatch):
+    mom = SpeakerEmbeddingRecord(user_id="mom", display_name="엄마", embedding=[0.6, 0.8])
+    monkeypatch.setattr(speaker_service_module, "get_active_speaker_embeddings", lambda: [DAD, mom])
+    service = SpeakerService()
+
+    profile, similarity = service.find_closest_profile(np.array([0.0, 1.0]))
+
+    assert profile.user_id == "mom"
+    assert similarity == pytest.approx(0.8)
+
+
+def test_find_closest_profile_returns_none_without_profiles(monkeypatch):
+    monkeypatch.setattr(speaker_service_module, "get_active_speaker_embeddings", lambda: [])
+
+    assert SpeakerService().find_closest_profile(np.array([0.0, 1.0])) is None
+
+
 def test_db_failure_resets_to_idle_without_cache_invalidation(enrollment, upsert_mock, fake_speaker_service):
     upsert_mock.return_value = False
     enrollment.start()
     enrollment.handle_turn(LONG_AUDIO, "민수")
+    enrollment.handle_turn(LONG_AUDIO, SAMPLE_1)
 
-    reply = enrollment.handle_turn(LONG_AUDIO, "오늘 날씨가 참 좋다")
+    reply = enrollment.handle_turn(LONG_AUDIO, SAMPLE_2)
 
     assert reply.completed is False
     assert reply.emotion == EmotionType.SAD
@@ -439,8 +622,11 @@ def test_full_voice_onboarding_hot_reloads_new_speaker_for_next_turn(monkeypatch
     worker.process_voice_interaction(LONG_AUDIO)
     assert enrollment.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
 
-    # 3) 목소리 샘플 -> DB 적재 + 캐시 무효화
-    _set_stt(monkeypatch, "오늘 날씨가 참 좋다")
+    # 3) 목소리 샘플 2개 -> 평균 임베딩 DB 적재 + 캐시 무효화 (기존 아빠와 유사도 0 -> 정상 신규 등록)
+    _set_stt(monkeypatch, SAMPLE_1)
+    worker.process_voice_interaction(LONG_AUDIO)
+    assert enrollment.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
+    _set_stt(monkeypatch, SAMPLE_2)
     action = worker.process_voice_interaction(LONG_AUDIO)
     assert action.speech == "등록이 완료되었어요! 민수 님, 이제부터 목소리로 바로 알아볼게요."
     assert len(fake_db) == 2

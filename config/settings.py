@@ -129,6 +129,26 @@ SPEAKER_ENROLLMENT_MIN_SAMPLE_SEC = 1.5
 # 목소리 샘플로 인정하는 최소 발화 길이(초, 무음 트리밍 후 실제 발화 기준). 너무 짧은 발화는 Resemblyzer가 화자 특징을 충분히
 # 추출하지 못해(SPEAKER_SHORT_UTTERANCE_MAX_SEC 참고) 등록 후 식별 정확도가 떨어지므로 재요청한다.
 
+SPEAKER_ENROLLMENT_REQUIRED_SAMPLES = 2
+# [다중 발화 평균화] 이름 응답 이후 수집하는 목소리 샘플 문장 수. 이름 발화("난 유미야")와 샘플 발화
+# 임베딩을 모두 평균(Average) 낸 뒤 L2 정규화해 최종 speaker_embedding으로 등록하므로, 단일 발화
+# 대비 발화 톤/마이크 거리 변화에 강건한 기준 벡터가 된다.
+
+SPEAKER_ENROLLMENT_MIN_NAME_SAMPLE_SEC = 0.5
+# 이름 응답 발화를 평균 임베딩에 포함시키는 최소 실제 발화 길이(초). 이름 발화는 원래 짧으므로 샘플
+# 기준(SPEAKER_ENROLLMENT_MIN_SAMPLE_SEC)보다 완화하되, 거의 무음인 캡처가 기준 벡터를 오염시키지
+# 않도록 이 값 미만이면 평균에서만 제외한다(재질문하지 않음).
+
+SPEAKER_ENROLLMENT_DUPLICATE_THRESHOLD = 0.85
+# [중복 등록 방지] 신규 평균 임베딩과 가장 가까운 기존 활성 화자의 유사도가 이 값 이상이면 확실한
+# 중복(기존 사용자의 재등록)으로 판단해, 새 user_id를 발급하지 않고 기존 프로필의 목소리를 갱신한다.
+# (동일 인물이 두 user_id로 쪼개지면 장기 기억/프로필 요약이 분산되고 1:N 식별도 불안정해진다.)
+
+SPEAKER_ENROLLMENT_SIMILAR_WARNING_THRESHOLD = 0.75
+# [유사 화자 경계] 유사도가 이 값 이상 ~ DUPLICATE_THRESHOLD 미만이면 형제/자매 등 목소리가 비슷한
+# 다른 가족일 가능성이 있으므로 덮어쓰지 않고 신규 등록을 허용하되, 경고 로그와 함께 헷갈릴 수 있다는
+# 안내 멘트로 분기한다. 이 값 미만은 정상 신규 화자 등록.
+
 # --- 다중 사용자 화자 식별(Multi-user Speaker Identification) 설정 ---
 SPEAKER_EMBEDDING_DIM = 256
 # Resemblyzer VoiceEncoder.embed_utterance()가 반환하는 d-vector 차원(고정값).
