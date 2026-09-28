@@ -158,6 +158,22 @@ class SpeakerService:
         return float(np.dot(a, b) / denom)
 
     @staticmethod
+    def average_embeddings(embeddings: List[Union[np.ndarray, list]]) -> np.ndarray:
+        """
+        [다중 발화 평균화] 여러 발화 임베딩을 평균(Average)한 뒤 L2 정규화(norm = 1.0)한 기준 벡터를 반환한다.
+        평균만 하면 발화 간 방향이 어긋난 만큼 노름이 1보다 작아지므로 반드시 재정규화한다.
+        입력이 비었거나 평균이 영벡터(서로 상쇄)면 기준 벡터로 쓸 수 없으므로 ValueError.
+        """
+        if not embeddings:
+            raise ValueError("평균낼 임베딩이 없습니다.")
+        stacked = np.stack([SpeakerService._coerce_to_float_array(e) for e in embeddings])
+        mean = stacked.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm == 0.0:
+            raise ValueError("평균 임베딩이 영벡터입니다.")
+        return (mean / norm).astype(np.float32)
+
+    @staticmethod
     def audio_duration_sec(audio: Union[np.ndarray, bytes], sample_rate: int = 16000) -> float:
         """
         트리밍 전 캡처 오디오 전체 길이(초). VAD 사전 버퍼/종료 무음이 포함되므로 짧은 발화 판정이나
@@ -335,6 +351,22 @@ class SpeakerService:
         self._last_passed_monotonic = time.monotonic()
         self._last_passed_user_id = user_id
         self._last_passed_display_name = display_name
+
+    def find_closest_profile(self, embedding: Union[np.ndarray, list]) -> Optional[Tuple[object, float]]:
+        """
+        [중복 등록 방지] 주어진 임베딩과 코사인 유사도가 가장 높은 활성 화자 프로필과 그 유사도를 반환한다.
+        활성 화자가 없으면 None. 식별 임계값/소프트패스 판정은 하지 않는 순수 최근접 조회다.
+        """
+        best_profile = None
+        best_similarity = -1.0
+        for profile in self._load_active_profiles():
+            similarity = self.cosine_similarity(embedding, profile.embedding)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_profile = profile
+        if best_profile is None:
+            return None
+        return best_profile, best_similarity
 
     def has_enrolled_speakers(self) -> bool:
         """1:N 식별 대상으로 등록된 활성 화자가 한 명이라도 있는지 여부."""

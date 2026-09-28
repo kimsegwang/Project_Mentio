@@ -1,14 +1,20 @@
 """
 tests/test_voice_vision_e2e.py
 자연스러운 인터랙션 순서: 음성 청취 -> 발화 종료 즉시 웹캠 캡처 -> VLM 추론
+
+⚠️ 실제 웹캠을 연 채 마이크 입력을 무기한 대기하는 대화형 테스트이므로 기본 실행에서는 스킵된다
+   (tests/conftest.py 참고). 실행: pytest tests/test_voice_vision_e2e.py --run-hardware -s
 """
 import cv2
+import pytest
+
 from config import settings
 from server.repositories.connection import init_db_pool, close_db_pool
 from server.services.audio_listener_service import audio_listener_service
 from server.services.vision_service import VisionService
 from server.workers.ai_worker import ai_worker
 
+@pytest.mark.hardware
 def test_voice_vision_pipeline():
     print("=" * 60)
     print(" [테스트] 자연스러운 음성-비전 인터랙션 검증")

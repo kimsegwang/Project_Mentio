@@ -47,6 +47,12 @@ class EnrollmentReply(BaseModel):
     completed: bool = Field(default=False, description="이번 턴에서 화자 등록이 최종 완료되었는지 여부")
     user_id: Optional[str] = Field(default=None, description="등록 완료 시 신규 발급된 user_id")
     display_name: Optional[str] = Field(default=None, description="등록 완료 시 저장된 표시 이름")
+    updated_existing: bool = Field(
+        default=False, description="확실한 중복 화자로 판정되어 신규 등록 대신 기존 프로필의 목소리를 갱신했는지 여부"
+    )
+    similar_to_user_id: Optional[str] = Field(
+        default=None, description="유사 화자 경계 구간으로 판정된 경우, 목소리가 비슷한 기존 화자의 user_id"
+    )
 
 
 class SpeakerProfile(BaseModel):

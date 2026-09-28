@@ -159,10 +159,14 @@ def enrollment_parts(monkeypatch):
     speaker = Mock()
     speaker.speech_duration_sec.side_effect = SpeakerService.speech_duration_sec
     speaker.embed_preprocessed.return_value = np.array([0.0, 1.0], dtype=np.float32)
-    enrollment = VoiceEnrollmentService(speaker_service_instance=speaker, min_sample_sec=1.5)
+    speaker.find_closest_profile.return_value = None
+    # 샘플 1개의 길이 검사/트리밍 재사용만 검증하므로 다중 샘플 수집은 끈다 (평균화는 test_voice_enrollment.py)
+    enrollment = VoiceEnrollmentService(speaker_service_instance=speaker, min_sample_sec=1.5, required_samples=1)
     enrollment.start()
     enrollment.handle_turn(_captured(1.0), "민수")
     assert enrollment.state == EnrollmentState.WAITING_FOR_VOICE_SAMPLE
+    speaker.preprocess.reset_mock()  # 이름 발화 임베딩 시도분은 샘플 검증 대상에서 제외
+    speaker.embed_preprocessed.reset_mock()
     return enrollment, speaker, upsert
 
 
