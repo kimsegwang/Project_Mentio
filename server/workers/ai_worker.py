@@ -9,7 +9,7 @@ from config import settings
 from server.repositories.log_repository import insert_interaction_log
 from server.repositories.preset_repository import load_emotion_presets, get_preset_for_emotion
 from server.repositories.memory_repository import get_profile_summary, search_similar_memories
-from server.schemas.action import RobotAction, LLMResponse, TriggerType
+from server.schemas.action import EmotionType, RobotAction, LLMResponse, TriggerType
 from server.services.brain_service import BrainService, brain_service
 from server.services.stt_service import stt_service
 from server.services.intent_service import intent_service
@@ -17,7 +17,8 @@ from server.services.embedding_service import embedding_service
 from server.services.question_detector import question_detector
 from server.services.speaker_service import SpeakerService, speaker_service
 from server.services.voice_enrollment_service import VoiceEnrollmentService, voice_enrollment_service
-from server.schemas.speaker import EnrollmentReply
+from server.services.speaker_correction_service import SpeakerCorrectionService, speaker_correction_service
+from server.schemas.speaker import EnrollmentReply, SpeakerCorrection
 from server.workers.memory_write_worker import memory_write_worker
 from server.services.tts_service import TTSService
 from server.services.audio_player_service import AudioPlayerService
@@ -34,6 +35,7 @@ class AIWorker:
         audio_player_instance: Optional[AudioSink] = None,
         speaker_service_instance: SpeakerService = speaker_service,
         enrollment_service_instance: VoiceEnrollmentService = voice_enrollment_service,
+        correction_service_instance: SpeakerCorrectionService = speaker_correction_service,
         on_task_completed: Optional[callable] = None, # 💡 콜백 주입받기
     ):
         self.brain_service = brain_service_instance
@@ -41,6 +43,7 @@ class AIWorker:
         self.audio_player = audio_player_instance or AudioPlayerService()
         self.speaker_service = speaker_service_instance
         self.enrollment_service = enrollment_service_instance
+        self.correction_service = correction_service_instance
         self.on_task_completed = on_task_completed
 
         self.request_queue: queue.Queue[Tuple[str, str, List[Any], float]] = queue.Queue(maxsize=1)
@@ -233,6 +236,41 @@ class AIWorker:
             self._play_speech_and_guard(action.speech)
         return action
 
+    def _deliver_speaker_correction(
+        self, correction: SpeakerCorrection, user_text: str, total_start: float
+    ) -> RobotAction:
+        """[호칭 정정] 세션 화자를 강제 전환하고 사과 멘트를 UI 선반영 -> TTS 재생한다.
+        정정 발화는 사용자 기억이 아니고, 직전 식별이 틀렸던 발화라 RAG 적재/EMA 갱신은 하지 않는다."""
+        speech = self.correction_service.apply(correction)
+        preset = get_preset_for_emotion(EmotionType.SURPRISED.value)
+        action = RobotAction(
+            emotion=EmotionType.SURPRISED,
+            speech=speech,
+            led_rgb=preset["rgb"],
+            duration=preset["duration"]
+        )
+        total_latency = time.time() - total_start
+        trigger_str = TriggerType.VOICE_SPEAKER_CORRECTION.value
+        print(
+            f"🪪 [Speaker Correction] {correction.previous_user_id} -> {correction.user_id} "
+            f"({correction.display_name}) | 발화: \"{user_text}\" ({total_latency:.2f}s)"
+        )
+
+        try:
+            insert_interaction_log(
+                trigger_type=trigger_str,
+                prompt=f"[호칭 정정] \"{user_text}\"",
+                action=action,
+                latency_seconds=total_latency
+            )
+        except Exception as e:
+            print(f"[AIWorker DB Warning] 로그 적재 실패: {e}")
+
+        self.response_queue.put((action, trigger_str, total_latency))
+        if action.speech:
+            self._play_speech_and_guard(action.speech)
+        return action
+
     def _process_enrollment_turn(
         self, audio_data: Union[np.ndarray, bytes], total_start: float
     ) -> Optional[RobotAction]:
@@ -271,6 +309,12 @@ class AIWorker:
         if not identification.is_match:
             print("[AIWorker] 화자 식별 실패 -> 등록되지 않은 화자로 판단, 파이프라인 진입을 차단합니다.")
             return None
+        if identification.is_ambiguous:
+            print(
+                f"⚖️ [AIWorker] 화자 식별 모호 (2위: {identification.second_user_id} "
+                f"{identification.second_similarity:.3f}, 마진: {identification.margin:.3f}) "
+                f"-> 이번 발화는 장기 기억 적재를 억제합니다."
+            )
 
         user_id = identification.user_id or settings.DEFAULT_USER_ID
 
@@ -290,6 +334,14 @@ class AIWorker:
         #      제3자/TV 소리가 스스로 온보딩을 열어 차단을 우회하지 못한다.
         if self.enrollment_service.is_enrollment_request(user_text):
             return self._deliver_enrollment_reply(self.enrollment_service.start(), user_text, total_start)
+
+        # 1-2. [호칭 정정] "나 민수인데?"처럼 식별된 화자와 다른 등록 화자로 정정하면, 세션 화자를
+        #      즉시 전환하고 사과 멘트로 응답한다 (정규식 룰 판별, LLM 호출 없음).
+        correction = self.correction_service.detect(
+            user_text, current_user_id=None if identification.skipped else identification.user_id
+        )
+        if correction is not None:
+            return self._deliver_speaker_correction(correction, user_text, total_start)
 
         # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION vs VOICE_TIME_RULE)
         t1 = time.time()
@@ -377,8 +429,15 @@ class AIWorker:
         # 9. [B-1] TTS 완료 후 규칙 기반 필터링 + 비동기 적재 (대화 지연 영향 0)
         #    MemoryWriteWorker의 순차 큐에 위임해, 연속 발화 시 모순 판정/무효화 순서가
         #    실제 발화 순서와 뒤바뀌는 경쟁 상태를 방지한다.
+        #    [화자 모호성 가드] 마진 미달 발화는 다른 가족의 개인 기억 오염 방지를 위해 적재를 억제한다.
         if trigger_str != TriggerType.VOICE_TIME_RULE.value:
-            memory_write_worker.submit(user_text, user_id=user_id)
+            memory_write_worker.submit(
+                user_text, user_id=user_id, speaker_ambiguous=identification.is_ambiguous
+            )
+
+        # 10. [EMA] 고신뢰(원점수 >= 0.82, 비모호, 1초 이상) 발화면 화자 기준 벡터 점진 갱신을 같은 순차 큐에 위임
+        if self.speaker_service.is_ema_eligible(identification):
+            memory_write_worker.submit_speaker_ema(identification.user_id, identification.embedding)
 
         return action
 

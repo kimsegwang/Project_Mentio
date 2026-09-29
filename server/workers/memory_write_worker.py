@@ -20,23 +20,37 @@ PROFILE_SUMMARY_TRIGGER_COUNT에 도달하거나(또는 기존 프로필 요약�
 상태의 최초 적재 시점에) memory_service.summarize_user_profile()을 같은 스레드에서
 호출한다. 별도 스케줄러 없이 기존 순차 큐에 얹는 방식이라 "대화 지연에 영향 없음"
 원칙을 그대로 유지한다.
+
+[화자 모호성 가드]
+화자 식별이 모호(Top-1/Top-2 마진 미달)했던 발화는 다른 가족의 개인 기억/프로필을 오염시킬 수
+있으므로 submit(speaker_ambiguous=True)로 전달되면 적재 자체를 억제한다.
+
+[화자 임베딩 EMA 갱신]
+고신뢰 식별 발화의 화자 임베딩 EMA 갱신(DB 쓰기)도 같은 순차 큐로 처리한다. 대화 턴에 DB 쓰기
+지연을 더하지 않으면서, 같은 화자의 연속 갱신이 서로 덮어쓰지 않도록 순서를 보장한다.
 """
 import queue
 import threading
 import logging
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from config import settings
 from server.repositories.memory_repository import get_profile_summary
 from server.services import memory_service
+from server.services.speaker_service import SpeakerService, speaker_service
 
 logger = logging.getLogger(__name__)
 
+# 큐 작업 종류: ("memory", user_text, user_id) / ("speaker_ema", user_id, embedding)
+_TASK_MEMORY = "memory"
+_TASK_SPEAKER_EMA = "speaker_ema"
+
 
 class MemoryWriteWorker:
-    def __init__(self):
-        self._queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+    def __init__(self, speaker_service_instance: SpeakerService = speaker_service):
+        self.speaker_service = speaker_service_instance
+        self._queue: "queue.Queue[Tuple]" = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # [Memory Summarization] 사용자별 "직전 요약 이후 신규 적재된 기억" 누적 카운터.
@@ -57,26 +71,42 @@ class MemoryWriteWorker:
             self._thread.join(timeout=1.0)
         print("[MemoryWriteWorker] 워커 스레드 종료 완료.")
 
-    def submit(self, user_text: str, user_id: str = settings.DEFAULT_USER_ID) -> None:
+    def submit(
+        self, user_text: str, user_id: str = settings.DEFAULT_USER_ID, speaker_ambiguous: bool = False
+    ) -> None:
         """
         대화 턴(TTS 완료 후 호출)에 영향 없는 논블로킹 큐잉.
         처리 순서 보장을 위해 호출부에서 별도 스레드를 직접 띄우지 않는다.
+        speaker_ambiguous=True(화자 식별 마진 미달)이면 개인 기억 오염 방지를 위해 적재하지 않는다.
         """
-        self._queue.put_nowait((user_text, user_id))
+        if speaker_ambiguous:
+            logger.info(f"[MemoryWriteWorker] 화자 식별 모호 -> 장기 기억 적재 억제 (user: {user_id})")
+            return
+        self._queue.put_nowait((_TASK_MEMORY, user_text, user_id))
+
+    def submit_speaker_ema(self, user_id: str, embedding: List[float]) -> None:
+        """고신뢰 식별 발화의 화자 임베딩 EMA 갱신을 순차 큐에 위임한다 (논블로킹)."""
+        self._queue.put_nowait((_TASK_SPEAKER_EMA, user_id, embedding))
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                user_text, user_id = self._queue.get(timeout=0.2)
+                task = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
             try:
-                new_id = memory_service.extract_and_store(user_text, user_id)
-                if new_id is not None:
-                    self._handle_new_memory_inserted(user_id)
+                kind = task[0]
+                if kind == _TASK_SPEAKER_EMA:
+                    _, user_id, embedding = task
+                    self.speaker_service.apply_ema_update(user_id, embedding)
+                else:
+                    _, user_text, user_id = task
+                    new_id = memory_service.extract_and_store(user_text, user_id)
+                    if new_id is not None:
+                        self._handle_new_memory_inserted(user_id)
             except Exception as e:
-                logger.warning(f"[MemoryWriteWorker] 기억 적재 처리 중 예외 발생: {e}")
+                logger.warning(f"[MemoryWriteWorker] 백그라운드 작업({task[0]}) 처리 중 예외 발생: {e}")
             finally:
                 self._queue.task_done()
 

@@ -27,7 +27,11 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 
 from config import settings
-from server.repositories.speaker_repository import get_active_speaker_embeddings
+from server.repositories.speaker_repository import (
+    get_active_speaker_embeddings,
+    get_speaker_embedding,
+    update_speaker_embedding,
+)
 from server.schemas.speaker import SpeakerIdentificationResult, SpeakerVerificationResult
 
 logger = logging.getLogger(__name__)
@@ -65,8 +69,10 @@ class SpeakerService:
         self._load_lock = threading.Lock()
         self._reference_embedding: Optional[np.ndarray] = None
         self._reference_loaded = False
-        # [세션 소프트패스] 직전에 검증을 통과(하드/소프트 무관)한 시각(monotonic).
-        # 단일 오디오 파이프라인 스레드에서만 갱신/조회되므로 별도 락 없이 안전하다.
+        # [세션 소프트패스 / 세션 락] 직전에 검증을 통과(하드/소프트 무관)한 시각(monotonic).
+        # 오디오 파이프라인 스레드 외에 Hot Reload 폴러(_reconcile_session_speaker)도 세션 화자를
+        # 정리하므로, 세션 3필드(시각/user_id/호칭)는 _session_lock으로 함께 갱신한다.
+        self._session_lock = threading.Lock()
         self._last_passed_monotonic: Optional[float] = None
         # [다중 사용자 식별] 직전에 통과한 화자의 user_id/display_name. 세션 소프트패스로
         # 통과할 때 "같은 사람이 계속 말하는 중"이라는 가정 하에 동일 화자로 귀속시키는 데 쓰인다.
@@ -329,28 +335,29 @@ class SpeakerService:
 
     def _reconcile_session_speaker(self, profiles: List) -> None:
         """갱신된 프로필 기준으로 세션 소프트패스 기준 화자 정보를 정리한다."""
-        user_id = self._last_passed_user_id
-        if user_id is None:
-            return
-        matched = next((p for p in profiles if p.user_id == user_id), None)
+        with self._session_lock:
+            user_id = self._last_passed_user_id
+            if user_id is None:
+                return
+            matched = next((p for p in profiles if p.user_id == user_id), None)
+            if matched is None:
+                self._last_passed_monotonic = None
+                self._last_passed_user_id = None
+                self._last_passed_display_name = None
+            else:
+                self._last_passed_display_name = matched.display_name
         if matched is None:
-            self._last_passed_monotonic = None
-            self._last_passed_user_id = None
-            self._last_passed_display_name = None
             logger.info(f"[SpeakerService] 비활성화/삭제된 화자의 세션 소프트패스 해제 (user: {user_id})")
-        else:
-            self._last_passed_display_name = matched.display_name
 
     def anchor_session_speaker(self, user_id: str, display_name: Optional[str]) -> None:
         """
-        [대화형 온보딩] 방금 등록을 마친 화자를 세션 소프트패스의 기준 화자로 지정한다.
-        온보딩 중에는 identify_speaker()를 바이패스하므로 소프트패스 기준이 여전히 등록을
-        요청했던 기존 화자로 남아 있을 수 있다. 이 상태로 신규 화자가 곧바로 짧게 말하면
-        기존 화자로 잘못 귀속(기억 오염)될 수 있으므로, 등록 직후 신규 화자로 명시 갱신한다.
+        세션 화자(소프트패스 기준 + 세션 락 우선권 대상)를 명시적으로 지정한다.
+        - [대화형 온보딩] 온보딩 중에는 identify_speaker()를 바이패스하므로 소프트패스 기준이 여전히
+          등록을 요청했던 기존 화자로 남아 있을 수 있다. 이 상태로 신규 화자가 곧바로 짧게 말하면
+          기존 화자로 잘못 귀속(기억 오염)될 수 있으므로, 등록 직후 신규 화자로 명시 갱신한다.
+        - [호칭 정정] "나 민수야"로 정정되면 즉시 정정 대상 화자로 세션을 강제 전환한다.
         """
-        self._last_passed_monotonic = time.monotonic()
-        self._last_passed_user_id = user_id
-        self._last_passed_display_name = display_name
+        self._mark_session_speaker(user_id, display_name)
 
     def find_closest_profile(self, embedding: Union[np.ndarray, list]) -> Optional[Tuple[object, float]]:
         """
@@ -387,6 +394,12 @@ class SpeakerService:
         "제3자/미등록 화자의 발화"로 간주해 파이프라인 진입 자체를 차단(무시)해야 한다.
         검증이 비활성화되었거나 등록된 화자가 전무한 경우에는 skipped=True와 함께
         DEFAULT_USER_ID로 판정해, 화자 등록 전 상태의 기존 단일 사용자 동작을 그대로 보존한다.
+
+        [마진 검증] 후보가 2명 이상이고 원점수 Top-1/Top-2 차이가 SPEAKER_MARGIN_THRESHOLD 미만이면
+        is_ambiguous=True와 2위 정보를 함께 반환한다(호출부는 장기 기억 적재를 억제한다).
+        [세션 락] SPEAKER_SESSION_TIMEOUT_SEC 이내의 세션 화자는 임계값 판정 시 SPEAKER_SESSION_BONUS를
+        가산받고, 모호한 상황에서 Top-2 안에 있으면 우선권을 가진다. 다른 화자가 마진 이상 확실히
+        앞서면 그 화자로 세션이 자동 교체된다. similarity는 항상 가산 전 원점수다.
         """
         if not settings.SPEAKER_VERIFICATION_ENABLED:
             return SpeakerIdentificationResult(is_match=True, skipped=True, user_id=settings.DEFAULT_USER_ID)
@@ -400,20 +413,37 @@ class SpeakerService:
             candidate, duration_sec = self.embed_with_speech_duration(audio, sample_rate=sample_rate)
             threshold, is_short_utterance = self._threshold_for_speech_duration(duration_sec)
 
-            best_profile = None
-            best_similarity = -1.0
-            for profile in profiles:
-                # cosine_similarity 내부에서 dtype=np.float32 강제 변환을 수행하므로,
-                # profile.embedding이 list/np.ndarray/pgvector.Vector 무엇이든 안전하게 처리된다.
-                similarity = self.cosine_similarity(candidate, profile.embedding)
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_profile = profile
+            # cosine_similarity 내부에서 dtype=np.float32 강제 변환을 수행하므로,
+            # profile.embedding이 list/np.ndarray/pgvector.Vector 무엇이든 안전하게 처리된다.
+            ranked = sorted(
+                ((profile, self.cosine_similarity(candidate, profile.embedding)) for profile in profiles),
+                key=lambda pair: pair[1],
+                reverse=True,
+            )
+            top_profile, top_similarity = ranked[0]
+            second = ranked[1] if len(ranked) > 1 else None
 
-            is_match = best_similarity >= threshold
+            # [마진 검증] 원점수(세션 가산 전) Top-1/Top-2 차이로 모호성을 판정한다.
+            margin = (top_similarity - second[1]) if second is not None else None
+            is_ambiguous = margin is not None and margin < settings.SPEAKER_MARGIN_THRESHOLD
+
+            # [세션 락] 세션 화자에게 가산점을 주고, 모호한 상황에서 세션 화자가 Top-2 안에 있으면
+            # 우선권을 준다. 다른 화자가 마진 이상 확실히 앞서면(모호하지 않으면) 원점수 1위를 따른다.
+            session_user_id = self._active_session_user_id()
+            chosen_profile, chosen_similarity = top_profile, top_similarity
+            resolved_by_session = False
+            if session_user_id is not None:
+                session_entry = next((pair for pair in ranked[:2] if pair[0].user_id == session_user_id), None)
+                if is_ambiguous and session_entry is not None:
+                    chosen_profile, chosen_similarity = session_entry
+                    resolved_by_session = session_entry[0] is not top_profile
+            session_bonus_applied = session_user_id is not None and chosen_profile.user_id == session_user_id
+            decision_score = chosen_similarity + (settings.SPEAKER_SESSION_BONUS if session_bonus_applied else 0.0)
+
+            is_match = decision_score >= threshold
             soft_passed = False
-            result_user_id = best_profile.user_id if best_profile is not None else None
-            result_display_name = best_profile.display_name if best_profile is not None else None
+            result_user_id = chosen_profile.user_id
+            result_display_name = chosen_profile.display_name
 
             if not is_match and self._is_within_session_soft_pass_window():
                 is_match = True
@@ -424,18 +454,23 @@ class SpeakerService:
                 result_display_name = self._last_passed_display_name or result_display_name
 
             if is_match:
-                self._last_passed_monotonic = time.monotonic()
-                self._last_passed_user_id = result_user_id
-                self._last_passed_display_name = result_display_name
+                self._mark_session_speaker(result_user_id, result_display_name)
 
             note = ""
             if soft_passed:
                 note = f" [세션 소프트패스: 최근 {settings.SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC:.0f}초 이내 통과 이력]"
             elif is_short_utterance:
                 note = f" [짧은 발화 {duration_sec:.2f}s, 완화 임계값 적용]"
+            if session_bonus_applied:
+                note += f" [세션 화자 가산 +{settings.SPEAKER_SESSION_BONUS:.2f}]"
+            if is_ambiguous:
+                note += (
+                    f" [모호: 2위 {second[0].user_id} {second[1]:.3f}, 마진 {margin:.3f}"
+                    f"{', 세션 화자 우선' if resolved_by_session else ''}]"
+                )
 
             logger.info(
-                f"[SpeakerService] 화자 식별 점수: {best_similarity:.3f} (기준: {threshold:.3f}) -> "
+                f"[SpeakerService] 화자 식별 점수: {chosen_similarity:.3f} (기준: {threshold:.3f}) -> "
                 f"{'통과 (user: ' + str(result_user_id) + ')' if is_match else '실패 (미등록 화자로 판단, 차단)'}{note}"
             )
 
@@ -443,13 +478,120 @@ class SpeakerService:
                 user_id=result_user_id if is_match else None,
                 display_name=result_display_name if is_match else None,
                 is_match=is_match,
-                similarity=best_similarity,
+                similarity=chosen_similarity,
                 threshold=threshold,
                 soft_passed=soft_passed,
+                is_ambiguous=is_ambiguous,
+                margin=margin,
+                second_user_id=second[0].user_id if second is not None else None,
+                second_display_name=second[0].display_name if second is not None else None,
+                second_similarity=second[1] if second is not None else None,
+                session_bonus_applied=session_bonus_applied,
+                resolved_by_session=resolved_by_session,
+                speech_duration_sec=duration_sec,
+                embedding=self._coerce_to_float_array(candidate).tolist(),
             )
         except Exception as e:
             logger.warning(f"[SpeakerService] 화자 식별 처리 중 예외 발생, 안전하게 통과 처리: {e}")
             return SpeakerIdentificationResult(is_match=True, skipped=True, user_id=settings.DEFAULT_USER_ID)
+
+    # --- [세션 락] ---
+
+    def _mark_session_speaker(self, user_id: Optional[str], display_name: Optional[str]) -> None:
+        with self._session_lock:
+            self._last_passed_monotonic = time.monotonic()
+            self._last_passed_user_id = user_id
+            self._last_passed_display_name = display_name
+
+    def _active_session_user_id(self) -> Optional[str]:
+        """마지막 통과로부터 SPEAKER_SESSION_TIMEOUT_SEC 이내인 세션 화자의 user_id. 만료/없음이면 None."""
+        with self._session_lock:
+            if self._last_passed_monotonic is None or self._last_passed_user_id is None:
+                return None
+            if time.monotonic() - self._last_passed_monotonic > settings.SPEAKER_SESSION_TIMEOUT_SEC:
+                return None
+            return self._last_passed_user_id
+
+    def get_session_speaker(self) -> Optional[Tuple[str, Optional[str]]]:
+        """현재 유효한 세션 화자의 (user_id, display_name). 만료/없음이면 None."""
+        user_id = self._active_session_user_id()
+        if user_id is None:
+            return None
+        with self._session_lock:
+            return user_id, self._last_passed_display_name
+
+    def find_active_profile_by_name(self, name: str) -> Optional[object]:
+        """
+        [호칭 정정] 발화에서 추출한 이름과 표시 이름이 일치하는 활성 화자를 찾는다.
+        공백/'님' 차이는 무시한다. 같은 이름이 여러 명이면 오귀속을 피하기 위해 None.
+        """
+        target = self._normalize_display_name(name)
+        if not target:
+            return None
+        matches = [p for p in self._load_active_profiles() if self._normalize_display_name(p.display_name) == target]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _normalize_display_name(name: Optional[str]) -> str:
+        normalized = "".join((name or "").split())
+        return normalized[:-1] if normalized.endswith("님") and len(normalized) > 1 else normalized
+
+    # --- [EMA 점진적 임베딩 업데이트] ---
+
+    @staticmethod
+    def compute_ema_embedding(
+        current: Union[np.ndarray, list], new_input: Union[np.ndarray, list], alpha: float
+    ) -> np.ndarray:
+        """new = normalize((1 - alpha) * current + alpha * input). 결과가 영벡터면 ValueError."""
+        current_vec = SpeakerService._coerce_to_float_array(current)
+        input_vec = SpeakerService._coerce_to_float_array(new_input)
+        if current_vec.shape != input_vec.shape:
+            raise ValueError(f"임베딩 차원 불일치: {current_vec.shape} vs {input_vec.shape}")
+        mixed = (1.0 - alpha) * current_vec + alpha * input_vec
+        norm = float(np.linalg.norm(mixed))
+        if norm == 0.0:
+            raise ValueError("EMA 결과가 영벡터입니다.")
+        return (mixed / norm).astype(np.float32)
+
+    @staticmethod
+    def is_ema_eligible(result: SpeakerIdentificationResult) -> bool:
+        """
+        고신뢰 식별 발화만 EMA 갱신 후보로 인정한다: 원점수 유사도 >= SPEAKER_EMA_MIN_SIMILARITY,
+        모호하지 않음, 실제 발화 길이 >= SPEAKER_EMA_MIN_SPEECH_SEC. 스킵/소프트패스 판정이나 임베딩이
+        없는 결과는 "그 화자의 목소리"라는 근거가 약하므로 제외한다.
+        """
+        return (
+            settings.SPEAKER_EMA_ENABLED
+            and result.is_match
+            and not result.skipped
+            and not result.soft_passed
+            and not result.is_ambiguous
+            and result.user_id is not None
+            and result.embedding is not None
+            and result.similarity is not None
+            and result.similarity >= settings.SPEAKER_EMA_MIN_SIMILARITY
+            and result.speech_duration_sec is not None
+            and result.speech_duration_sec >= settings.SPEAKER_EMA_MIN_SPEECH_SEC
+        )
+
+    def apply_ema_update(self, user_id: str, input_embedding: Union[np.ndarray, list]) -> bool:
+        """
+        [백그라운드 전용] DB의 최신 기준 벡터에 이번 발화 임베딩을 EMA로 반영해 저장한다.
+        MemoryWriteWorker 순차 큐에서만 호출되며(대화 턴 지연 0), 저장 시 갱신되는 updated_at을
+        SpeakerCacheSyncWorker가 감지해 캐시를 핫 리로드한다.
+        """
+        current = get_speaker_embedding(user_id)
+        if current is None:
+            logger.info(f"[SpeakerService] EMA 대상 화자 없음/비활성 -> 갱신 생략 (user: {user_id})")
+            return False
+        updated = self.compute_ema_embedding(current, input_embedding, settings.SPEAKER_EMA_ALPHA)
+        success = update_speaker_embedding(user_id, updated.tolist())
+        drift = 1.0 - self.cosine_similarity(current, updated)
+        logger.info(
+            f"[SpeakerService] 화자 임베딩 EMA 갱신 {'완료' if success else '실패'} "
+            f"(user: {user_id}, alpha: {settings.SPEAKER_EMA_ALPHA}, 변화량: {drift:.5f})"
+        )
+        return success
 
 
 # Spring Bean 스타일 전역 싱글톤 등록

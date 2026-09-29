@@ -81,3 +81,27 @@ class SpeakerIdentificationResult(BaseModel):
     threshold: Optional[float] = Field(default=None, description="이번 판정에 실제 적용된 임계값 (검증 자체를 스킵한 경우 None)")
     skipped: bool = Field(default=False, description="비활성화 플래그 또는 등록된 화자가 전무하여 식별 자체를 스킵했는지 여부")
     soft_passed: bool = Field(default=False, description="임계값 미달이지만 세션 소프트패스(최근 통과 이력)로 통과 처리되었는지 여부")
+    # --- [마진 검증 / 세션 락] ---
+    is_ambiguous: bool = Field(
+        default=False, description="후보가 2명 이상이고 Top-1/Top-2 원점수 차이가 SPEAKER_MARGIN_THRESHOLD 미만인지 여부"
+    )
+    margin: Optional[float] = Field(default=None, description="Top-1 - Top-2 원점수(세션 가산 전) 유사도 차이 (후보 1명이면 None)")
+    second_user_id: Optional[str] = Field(default=None, description="원점수 2위 후보의 user_id")
+    second_display_name: Optional[str] = Field(default=None, description="원점수 2위 후보의 표시 이름")
+    second_similarity: Optional[float] = Field(default=None, description="원점수 2위 후보의 코사인 유사도")
+    session_bonus_applied: bool = Field(default=False, description="최종 화자가 세션 화자로서 가산점을 받았는지 여부")
+    resolved_by_session: bool = Field(default=False, description="모호한 상황에서 세션 화자 우선권으로 최종 화자가 결정되었는지 여부")
+    # --- [EMA 갱신 후보] ---
+    speech_duration_sec: Optional[float] = Field(default=None, description="무음 트리밍 후 실제 발화 길이(초)")
+    embedding: Optional[SpeakerEmbeddingVector] = Field(
+        default=None, exclude=True, repr=False, description="이번 발화의 화자 임베딩 (EMA 갱신용, 직렬화/로그 제외)"
+    )
+
+
+class SpeakerCorrection(BaseModel):
+    """대화형 호칭 정정("나 민수야") 판정 결과."""
+
+    user_id: str = Field(description="정정 대상(실제 화자)의 user_id")
+    display_name: str = Field(description="정정 대상의 표시 이름")
+    spoken_name: str = Field(description="발화에서 추출한 이름 원문")
+    previous_user_id: Optional[str] = Field(default=None, description="정정 전 식별되어 있던 user_id")
