@@ -162,3 +162,32 @@ SPEAKER_CACHE_POLL_INTERVAL_SEC = float(os.getenv("SPEAKER_CACHE_POLL_INTERVAL_S
 # [Hot Reload] 대시보드 등 외부에서 speaker_profiles가 변경되었는지 확인하는 경량 폴링 주기(초).
 # 변경 지문(MAX(updated_at), 행 수)이 달라졌을 때만 화자 캐시를 재적재하며, 로봇이 발화 처리 중이거나
 # 음성 온보딩이 진행 중이면 다음 주기로 보류한다.
+
+# --- 화자 식별 안정화(마진 검증 / 세션 락 / EMA) 설정 ---
+SPEAKER_MARGIN_THRESHOLD = 0.04
+# [마진 검증] Top-1과 Top-2 화자의 코사인 유사도 차이가 이 값 미만이면 "모호(is_ambiguous)"로 판정한다.
+# 형제/자매처럼 목소리가 비슷한 가족 사이에서는 1등이 근소하게 바뀌며 오귀속되기 쉬워, 모호한 발화는
+# 장기 기억 적재를 억제해 다른 가족의 개인 프로필이 오염되지 않도록 한다.
+
+SPEAKER_SESSION_TIMEOUT_SEC = 120.0
+# [세션 락] 마지막으로 식별(통과)된 화자를 "현재 대화 상대"로 유지하는 시간(초). 이 시간 이내의 후속 발화는
+# 세션 화자에게 SPEAKER_SESSION_BONUS 가산 및 모호 시 우선권을 준다. (임계값 미달 발화를 통과시키는
+# SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC(10초)와는 별개의, 더 긴 "후보 간 우선순위" 창이다.)
+
+SPEAKER_SESSION_BONUS = 0.03
+# [세션 락] 세션 화자의 이번 발화 유사도에 더하는 가산점. 순위/임계값 판정에만 쓰이며, 결과의 similarity와
+# EMA 트리거 판정에는 가산 전 원점수를 사용한다. 다른 화자가 마진(SPEAKER_MARGIN_THRESHOLD) 이상 확실히
+# 앞서면 가산점과 무관하게 세션 화자가 교체된다.
+
+SPEAKER_EMA_ENABLED = os.getenv("SPEAKER_EMA_ENABLED", "true").lower() == "true"
+# [점진적 임베딩 업데이트] 고신뢰 식별 발화로 화자 기준 벡터를 EMA로 천천히 갱신할지 여부.
+
+SPEAKER_EMA_MIN_SIMILARITY = 0.82
+# EMA 갱신을 허용하는 최소 원점수(세션 가산 전) 유사도. 오귀속 발화가 기준 벡터를 끌고 가는 드리프트를
+# 막기 위해 식별 임계값(0.65)보다 훨씬 높은 "확실한 본인" 구간에서만 갱신한다.
+
+SPEAKER_EMA_ALPHA = 0.05
+# EMA 반영 비율: new = normalize((1 - alpha) * current + alpha * input).
+
+SPEAKER_EMA_MIN_SPEECH_SEC = 1.0
+# EMA 갱신에 쓰는 발화의 최소 실제 발화 길이(초, 무음 트리밍 후). 짧은 발화는 임베딩 품질이 낮다.

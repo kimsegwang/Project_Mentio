@@ -568,7 +568,7 @@ def test_worker_does_not_route_normal_chat_into_enrollment(worker_parts, monkeyp
 
     assert action.speech == "일반 응답"
     assert enrollment.is_active() is False
-    submit_mock.assert_called_once_with("오늘 축구했어", user_id="dad")
+    submit_mock.assert_called_once_with("오늘 축구했어", user_id="dad", speaker_ambiguous=False)
 
 
 # --- 통합: 실제 SpeakerService 캐시 무효화로 다음 턴부터 신규 화자 식별 (Hot Reload) ---
@@ -638,7 +638,7 @@ def test_full_voice_onboarding_hot_reloads_new_speaker_for_next_turn(monkeypatch
     new_user_id = fake_db[-1].user_id
     assert action.speech == "일반 응답"
     assert mock_brain.infer_action.call_args.kwargs["display_name"] == "민수"
-    submit_mock.assert_called_once_with("나 오늘 축구했어", user_id=new_user_id)
+    submit_mock.assert_called_once_with("나 오늘 축구했어", user_id=new_user_id, speaker_ambiguous=False)
 
 
 def test_anchor_session_speaker_sets_soft_pass_identity(monkeypatch):

@@ -70,6 +70,52 @@ def upsert_speaker_profile(user_id: str, display_name: str, embedding: SpeakerEm
         return False
 
 
+def get_speaker_embedding(user_id: str) -> Optional[SpeakerEmbeddingVector]:
+    """
+    [EMA] 활성 화자 한 명의 현재 기준 임베딩을 DB에서 직접 조회한다. 없거나(비활성 포함) 실패 시 None.
+    메모리 캐시는 Hot Reload 주기만큼 늦을 수 있으므로, EMA 연속 갱신이 오래된 벡터를 기준으로
+    덮어쓰지 않도록 항상 DB 최신값을 기준으로 삼는다.
+    """
+    query = """
+        SELECT speaker_embedding
+        FROM speaker_profiles
+        WHERE user_id = %s AND is_active = TRUE;
+    """
+    try:
+        with get_db_connection() as conn:
+            register_vector(conn)
+            with conn.cursor() as cursor:
+                cursor.execute(query, (user_id,))
+                row = cursor.fetchone()
+                return _to_embedding_list(row[0]) if row is not None else None
+    except Exception as e:
+        logger.error(f"[SpeakerRepository Error] 화자 임베딩 조회 실패: {e}")
+        return None
+
+
+def update_speaker_embedding(user_id: str, embedding: SpeakerEmbeddingVector) -> bool:
+    """
+    [EMA] 활성 화자의 기준 임베딩만 갱신한다(호칭/활성 상태는 건드리지 않음). updated_at을 함께
+    갱신해 SpeakerCacheSyncWorker의 변경 지문(MAX(updated_at))이 바뀌도록 한다. 대상 행이 없으면 False.
+    """
+    query = """
+        UPDATE speaker_profiles
+        SET speaker_embedding = %s::vector, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = %s AND is_active = TRUE;
+    """
+    try:
+        with get_db_connection() as conn:
+            register_vector(conn)
+            with conn.cursor() as cursor:
+                cursor.execute(query, (embedding, user_id))
+                updated = cursor.rowcount > 0
+            conn.commit()
+            return updated
+    except Exception as e:
+        logger.error(f"[SpeakerRepository Error] 화자 임베딩 EMA 갱신 실패: {e}")
+        return False
+
+
 def get_active_speaker_embeddings() -> List[SpeakerEmbeddingRecord]:
     """
     1:N 코사인 유사도 비교 대상인 활성(is_active=TRUE) 화자 임베딩 전체를 조회한다.

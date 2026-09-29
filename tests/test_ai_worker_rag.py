@@ -326,7 +326,9 @@ def test_voice_chat_triggers_background_storage_after_tts(worker, monkeypatch):
 
     # MemoryWriteWorker의 순차 큐에 위임(submit)만 하고 즉시 반환되므로 대화 턴에는 지연이 없다.
     # 실제 extract_and_store 실행은 MemoryWriteWorker 자체의 단위 테스트에서 검증한다.
-    submit_mock.assert_called_once_with("내 이름은 김세강이야", user_id=ai_worker_module.settings.DEFAULT_USER_ID)
+    submit_mock.assert_called_once_with(
+        "내 이름은 김세강이야", user_id=ai_worker_module.settings.DEFAULT_USER_ID, speaker_ambiguous=False
+    )
 
 
 def test_no_recognized_text_does_not_touch_rag_pipeline(worker, monkeypatch):
@@ -369,7 +371,7 @@ def test_process_voice_interaction_threads_identified_user_id_into_rag_and_stora
     worker.process_voice_interaction(audio_data=b"dummy")
 
     retrieve_mock.assert_called_once_with("나 오늘 축구했어", user_id="child_a")
-    submit_mock.assert_called_once_with("나 오늘 축구했어", user_id="child_a")
+    submit_mock.assert_called_once_with("나 오늘 축구했어", user_id="child_a", speaker_ambiguous=False)
 
 
 def test_process_voice_interaction_passes_identified_display_name_to_brain_service(worker, monkeypatch):
@@ -455,4 +457,6 @@ def test_process_voice_interaction_falls_back_to_default_user_when_skipped(worke
     worker.process_voice_interaction(audio_data=b"dummy")
 
     retrieve_mock.assert_called_once_with("안녕", user_id=ai_worker_module.settings.DEFAULT_USER_ID)
-    submit_mock.assert_called_once_with("안녕", user_id=ai_worker_module.settings.DEFAULT_USER_ID)
+    submit_mock.assert_called_once_with(
+        "안녕", user_id=ai_worker_module.settings.DEFAULT_USER_ID, speaker_ambiguous=False
+    )
