@@ -22,6 +22,13 @@ DEFAULT_LLM_FALLBACK = LLMResponse(
     speech="생각이 조금 엉켰어요. 잠시 후에 다시 말해줘!"
 )
 
+# [콘솔 클린업] google-genai SDK는 tools를 넘기지 않아도 AFC(자동 함수 호출)를 기본 활성으로 간주해
+# Models.generate_content 첫 호출 시 "Direct use of automatic function calling (AFC) ... is not
+# recommended" 경고를 남긴다. Mentio는 function calling을 쓰지 않는 단발성(stateless) 호출이므로
+# Chat 세션(히스토리 누적)으로 바꾸는 대신 AFC를 명시적으로 끈다. SDK가 AFC 루프 없이 곧바로
+# 단일 요청 경로를 타므로 경고 제거와 함께 불필요한 오버헤드도 사라진다.
+AFC_DISABLED = types.AutomaticFunctionCallingConfig(disable=True)
+
 
 class BrainService:
     def __init__(self):
@@ -160,7 +167,8 @@ class BrainService:
             response_mime_type="application/json",
             temperature=0.2,
             max_output_tokens=1024,
-            thinking_config=types.ThinkingConfig(thinking_budget=1) # 0 대신 최소 단위인 1 지정
+            thinking_config=types.ThinkingConfig(thinking_budget=1), # 0 대신 최소 단위인 1 지정
+            automatic_function_calling=AFC_DISABLED,
         )
 
         for attempt in range(settings.MAX_RETRIES + 1):
@@ -229,6 +237,7 @@ class BrainService:
             temperature=0.0,
             max_output_tokens=256,
             thinking_config=types.ThinkingConfig(thinking_budget=1),
+            automatic_function_calling=AFC_DISABLED,
         )
 
         try:
@@ -284,6 +293,7 @@ class BrainService:
             temperature=0.3,
             max_output_tokens=1024,
             thinking_config=types.ThinkingConfig(thinking_budget=1),
+            automatic_function_calling=AFC_DISABLED,
         )
 
         try:
