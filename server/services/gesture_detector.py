@@ -9,8 +9,20 @@ Project Mentio - Vision Gesture Detector (MediaPipe Hands 기반)
 """
 
 import cv2
-import mediapipe as mp
 import math
+import warnings
+
+import mediapipe as mp
+
+# [콘솔 클린업] mediapipe 0.10.14 내부(mediapipe/python/packet_getter.py)가 프레임마다
+# protobuf의 deprecated API SymbolDatabase.GetPrototype()을 호출해 콘솔을 경고로 채운다.
+# 우리 코드가 아닌 서드파티 내부 이슈이고, protobuf는 mediapipe/streamlit 호환 때문에 <5로
+# 고정되어(requirements.txt 참고) 업그레이드로 해소할 수 없으므로, 이 경고 메시지 하나만 좁게 필터링한다.
+warnings.filterwarnings(
+    "ignore",
+    message=r"SymbolDatabase\.GetPrototype\(\) is deprecated",
+    category=UserWarning,
+)
 
 
 class HeartDetector:

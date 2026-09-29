@@ -20,6 +20,29 @@ ESP32-S3 마이크로컨트롤러, 로컬 파이썬 엣지 게이트웨이, 그�
   * **의문문 검색 최적화**: 의문사 및 질문 어미 감지 시 유사도 임계값을 0.68로 동적 완화하여 회상 정확도 향상.
 * **0ms 발화-UI 동기화**: TTS 음성 출력 직전 OLED 표정과 NeoPixel LED 색상을 즉각 전환하며, 발화 종료 시점부터 복귀 타이머를 앵커링합니다.
 * **5단계 의도 분석 엔진**: 호출어 정규화 $\rightarrow$ 룰 기반 시간 즉시 응답 $\rightarrow$ 시각 부정어 차단 $\rightarrow$ 비전 모드 진입 $\rightarrow$ 일반 텍스트 대화로 안전하게 수렴.
+* **다중 사용자 화자 식별 (가족 프로필)**: Resemblyzer 256차원 d-vector 기반 1:N 화자 식별로 가족 구성원을 목소리만으로 구분하고, 화자별로 장기 기억·프로필 요약·호칭을 격리합니다. 미등록 화자(제3자/TV 소리)는 파이프라인 진입을 차단합니다. (아래 **화자 식별 & 가족 프로필** 섹션 참고)
+
+---
+
+## 🎙️ 화자 식별 & 가족 프로필
+
+화자 식별은 VAD 직후·STT 이전에 수행되며, 판정된 `user_id`가 RAG 검색 → 프롬프트 페르소나 → 장기 기억 적재까지 일관되게 전달됩니다. 판별 로직은 모두 LLM 호출 없는 로컬 연산/정규식 룰로 동작해 대화 지연을 추가하지 않습니다.
+
+| 기능 | 동작 | 관련 설정 |
+| :--- | :--- | :--- |
+| **실제 발화 길이 기반 커트라인** | VAD 사전 버퍼·종료 무음(약 1.1초)을 트리밍한 **실제 발화 길이** 기준으로 임계값을 분기합니다. 일반 발화 `0.65`, 1.0초 이하 단문(“응”, “네”) `0.60`. | `SPEAKER_VERIFICATION_THRESHOLD`, `SPEAKER_SHORT_UTTERANCE_*` |
+| **마진(Margin) 모호성 가드** | Top-1/Top-2 화자 원점수 차이가 `0.04` 미만이면 “모호”로 판정하고, 해당 발화는 **장기 기억 적재를 억제**해 형제/자매 간 개인 기억 오염을 막습니다. | `SPEAKER_MARGIN_THRESHOLD` |
+| **대화 세션 락 (Session Lock)** | 마지막으로 통과한 화자를 120초간 “현재 대화 상대”로 유지하고, 판정 점수에 `+0.03` 가산 및 모호 시 우선권을 부여합니다. 다른 화자가 마진 이상 확실히 앞서면 세션이 자동 교체됩니다. 별도로 직전 통과 10초 이내 발화는 임계값 미달이어도 소프트패스로 통과시킵니다. | `SPEAKER_SESSION_TIMEOUT_SEC`, `SPEAKER_SESSION_BONUS`, `SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC` |
+| **대화형 호칭 정정** | “나 민수인데?”, “나 민수 아니고 지훈이야”처럼 발화 **전체**가 정정 표현이고 이름이 다른 등록 화자 1명과 일치하면, 세션 화자를 즉시 전환하고 “앗, 지훈아 미안해!”로 응답합니다. 정정 발화는 기억 적재/EMA 대상에서 제외됩니다. | — |
+| **대화형 음성 온보딩** | “내 목소리 등록해줘” → 이름 1회 + 샘플 문장 2회 발화를 받아 **임베딩 평균 + L2 정규화**로 기준 벡터를 등록합니다. 샘플은 실제 발화 1.5초 이상만 인정하며, 30초 무응답 시 세션이 자동 만료됩니다. | `SPEAKER_ENROLLMENT_*` |
+| **중복 등록 가드** | 기존 화자와 유사도 `≥ 0.85`면 재등록으로 보고 **기존 프로필 목소리만 갱신**(새 `user_id` 미발급), `0.75~0.85`면 유사 화자 경고 멘트와 함께 신규 등록을 허용합니다. | `SPEAKER_ENROLLMENT_DUPLICATE_THRESHOLD`, `SPEAKER_ENROLLMENT_SIMILAR_WARNING_THRESHOLD` |
+| **EMA 점진적 임베딩 갱신** | 원점수 `≥ 0.82`, 비모호, 실제 발화 1.0초 이상인 고신뢰 발화만 `new = normalize(0.95·current + 0.05·input)`으로 기준 벡터를 천천히 갱신합니다. DB 쓰기는 TTS 완료 후 `MemoryWriteWorker` 순차 큐에서 처리됩니다. | `SPEAKER_EMA_*` |
+| **화자 캐시 Hot Reload** | 백그라운드 워커가 10초마다 `speaker_profiles`의 경량 지문(`MAX(updated_at)`, 전체/활성 행 수)만 조회해, 변경 시에만 캐시를 원자적으로 교체합니다(**Zero-Downtime**, 재기동 불필요). 발화 처리/온보딩 중에는 다음 주기로 보류합니다. | `SPEAKER_CACHE_POLL_INTERVAL_SEC` |
+
+화자 등록 방법은 세 가지입니다:
+- **음성 온보딩**: 로봇에게 “내 목소리 등록해줘”라고 말하기
+- **CLI**: `python scripts/enroll_speaker.py --user-id dad --name 아빠`
+- **관리 대시보드**: `streamlit run web/app.py` (가족/화자 프로필 및 RAG 기억 관리, 변경 사항은 Hot Reload로 즉시 반영)
 
 ---
 
@@ -76,9 +99,11 @@ ESP32-S3 마이크로컨트롤러, 로컬 파이썬 엣지 게이트웨이, 그�
 ┌─────────────────────────────────────────────┴───────────────┐
 │ [로컬 엣지 게이트웨이: Python Fast Engine (PC)]             │
 │  - STT: faster-whisper (base, int8, CPU 구동)               │
+│  - Speaker ID: Resemblyzer 1:N 식별 (마진/세션 락/EMA)      │
+│  - SpeakerCacheSyncWorker: 10초 주기 화자 캐시 Hot Reload   │
 │  - Intent Engine: 5단계 분기 (룰 기반 시간, 시각 제어 등)   │
 │  - RAG Memory: FastEmbed + pgvector + QuestionDetector      │
-│  - MemoryWriteWorker: 순차 큐 기반 비동기 기억 적재         │
+│  - MemoryWriteWorker: 순차 큐 (기억 적재 + 화자 EMA 갱신)   │
 │  - AI Brain: Gemini 3.6 Flash (Auto-healing Parser)         │
 │  - TTS: Edge-TTS 스트리밍                                   │
 └──────────────┬──────────────────────────────────────────────┘
@@ -87,6 +112,8 @@ ESP32-S3 마이크로컨트롤러, 로컬 파이썬 엣지 게이트웨이, 그�
 │ [데이터베이스: PostgreSQL + pgvector]                        │
 │  - emotion_presets: 감정별 LED RGB 및 복귀 지속시간         │
 │  - user_long_term_memory: pgvector(384차원) + 기억 계보 추적│
+│  - user_profile_summary: 화자별 페르소나 요약               │
+│  - speaker_profiles: 화자 임베딩(256차원) + 호칭            │
 │  - interaction_logs: 텔레메트리 로그                        │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -125,9 +152,44 @@ pip install -r requirements.txt
 프로젝트 루트 디렉토리에 `.env` 파일을 구성합니다:
 
 ```env
-GEMINI_API_KEY=your_gemini_api_key
-DATABASE_URL=postgresql://user:password@localhost:5432/mentio_db
+GEMINI_API_KEY=your_gemini_api_key   # 필수 (미설정 시 기동 실패)
+
+# PostgreSQL 접속 정보 (기본값: localhost / 5432 / mentio_db / postgres / postgres)
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=mentio_db
+DB_USER=postgres
+DB_PASSWORD=postgres
+
+# 화자 식별 (선택, 괄호는 기본값)
+SPEAKER_VERIFICATION_ENABLED=true         # (true) false면 식별 스킵, 전원 기본 사용자로 통과
+SPEAKER_VERIFICATION_THRESHOLD=0.65       # (0.65) 일반 발화 식별 임계값
+SPEAKER_CACHE_POLL_INTERVAL_SEC=10        # (10) 화자 캐시 Hot Reload 폴링 주기(초)
+SPEAKER_EMA_ENABLED=true                  # (true) 고신뢰 발화 기반 EMA 임베딩 갱신
 ```
+
+#### 화자 식별 튜닝 상수 (`config/settings.py`)
+
+환경변수가 아닌 코드 상수로, 실기 로그 기반 튜닝 히스토리가 `config/settings.py` 주석에 기록되어 있습니다.
+
+| 설정 | 기본값 | 설명 |
+| :--- | :--- | :--- |
+| `SPEAKER_SHORT_UTTERANCE_MAX_SEC` | `1.0` | 무음 트리밍 후 실제 발화가 이 길이(초) 이하면 단문으로 간주 |
+| `SPEAKER_SHORT_UTTERANCE_THRESHOLD` | `0.60` | 단문 전용 완화 임계값 |
+| `SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC` | `10.0` | 직전 통과 후 이 시간 이내면 임계값 미달이어도 소프트패스 |
+| `SPEAKER_MARGIN_THRESHOLD` | `0.04` | Top-1/Top-2 차이가 이 값 미만이면 모호 판정 (기억 적재 억제) |
+| `SPEAKER_SESSION_TIMEOUT_SEC` | `120.0` | 세션 락 유지 시간 |
+| `SPEAKER_SESSION_BONUS` | `0.03` | 세션 화자 판정 가산점 (반환 similarity는 원점수) |
+| `SPEAKER_EMA_MIN_SIMILARITY` | `0.82` | EMA 갱신 허용 최소 원점수 |
+| `SPEAKER_EMA_ALPHA` | `0.05` | EMA 반영 비율 |
+| `SPEAKER_EMA_MIN_SPEECH_SEC` | `1.0` | EMA 갱신 최소 실제 발화 길이(초) |
+| `SPEAKER_ENROLLMENT_SESSION_TIMEOUT_SEC` | `30.0` | 온보딩 무응답 자동 만료 시간 |
+| `SPEAKER_ENROLLMENT_REQUIRED_SAMPLES` | `2` | 이름 발화 이후 수집하는 샘플 문장 수 |
+| `SPEAKER_ENROLLMENT_MIN_SAMPLE_SEC` | `1.5` | 샘플로 인정하는 최소 실제 발화 길이(초) |
+| `SPEAKER_ENROLLMENT_MIN_NAME_SAMPLE_SEC` | `0.5` | 이름 발화를 평균에 포함시키는 최소 실제 발화 길이(초) |
+| `SPEAKER_ENROLLMENT_DUPLICATE_THRESHOLD` | `0.85` | 이 이상이면 기존 화자 재등록 → 기존 프로필 목소리 갱신 |
+| `SPEAKER_ENROLLMENT_SIMILAR_WARNING_THRESHOLD` | `0.75` | 이 이상 ~ 0.85 미만이면 유사 화자 경고 후 신규 등록 |
+| `CAMERA_REOPEN_AFTER_FAILURES` | `100` | 카메라 프레임 연속 실패 시 재오픈 주기 (실패 중에는 음성 전용 모드) |
 
 ### 3. 데이터베이스 초기화
 
@@ -152,15 +214,18 @@ pytest tests/ -v
 
 ```text
 mentio/
+├── config/settings.py         # 환경 변수 및 공통 설정 (임계값 튜닝 히스토리 포함)
 ├── docs/                      # 시스템 명세서 및 기술 설계 문서
+├── scripts/enroll_speaker.py  # CLI 화자 등록 스크립트
 ├── server/
-│   ├── config/                # 환경 변수 및 공통 설정
+│   ├── adapters/              # 오디오 입출력 어댑터 (PC 사운드 ↔ ESP32 스트림 교체 지점)
 │   ├── repositories/          # DB 커넥션 풀, pgvector 쿼리 및 SQL 스키마
 │   ├── schemas/               # Pydantic DTO (데이터 검증 계층)
-│   ├── services/              # AI Brain, Intent, RAG Memory, Audio, Vision
-│   ├── workers/               # 비동기 순차 기억 적재 큐 (MemoryWriteWorker)
+│   ├── services/              # AI Brain, Intent, RAG Memory, Speaker ID, Voice Enrollment, Vision
+│   ├── workers/               # AIWorker, MemoryWriteWorker(순차 큐), SpeakerCacheSyncWorker(Hot Reload)
 │   └── main.py                # 로컬 엣지 게이트웨이 진입점
-└── tests/                     # 단위 및 통합 테스트 스위트
+├── web/app.py                 # Streamlit 관리 대시보드 (가족 프로필 / RAG 기억)
+└── tests/                     # 단위 및 통합 테스트 스위트 (하드웨어 테스트는 --run-hardware로 opt-in)
 ```
 
 ---

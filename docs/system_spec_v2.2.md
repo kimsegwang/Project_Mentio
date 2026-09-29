@@ -12,6 +12,20 @@
 | DB 연결 안정성 | `get_db_connection()` 컨텍스트 매니저의 실패 트랜잭션 롤백 가드, `pgvector` 파라미터 바인딩 시 `::vector` 명시적 캐스팅 반영 |
 | 동시성 제어 | `processing_lock`(Busy-Dropping), `MemoryWriteWorker` 단일 소비자 큐를 통한 기억 적재 순서 보장 구조 명문화 |
 
+## v2.2 이후 증분 변경 이력 (PR #36 ~ #42)
+
+> 파일명은 `CLAUDE.md` 참조 경로 유지를 위해 `system_spec_v2.2.md`를 그대로 사용하며, 이후 변경은 이 표에 누적합니다.
+
+| 구분 | 내용 |
+| :--- | :--- |
+| DB 스키마 | `user_profile_summary`(화자별 페르소나 요약), `speaker_profiles`(화자 임베딩 256차원 + 호칭) 테이블 추가 |
+| 다중 사용자 화자 식별 | 단일 `.npy` 1:1 검증 → DB 기반 1:N 식별(`identify_speaker`)로 전환. 식별된 `user_id` 기준으로 RAG/프로필 요약/기억 적재 격리, `display_name` 페르소나 프롬프트 바인딩 |
+| 화자 식별 안정화 | 실제 발화 길이(VAD 트리밍 후) 기반 커트라인, 마진 모호성 가드, 세션 락(+0.03), 대화형 호칭 정정, EMA 점진적 임베딩 갱신 (4-3절) |
+| 음성 온보딩 | 대화형 음성 등록 상태 머신, 다중 발화(이름 1 + 샘플 2) 평균화, 중복 등록 가드(0.85 갱신 / 0.75~0.85 유사 경고) |
+| Hot Reload | `SpeakerCacheSyncWorker` 10초 주기 지문 폴링으로 대시보드 변경을 무중단 반영 |
+| 관리 대시보드 | `web/app.py` (Streamlit): 가족/화자 프로필, RAG 기억 & 프로필 요약 관리 |
+| 콘솔 클린업 | Gemini AFC 비권장 경고 제거(`automatic_function_calling.disable=True`), mediapipe 내부 protobuf `GetPrototype()` deprecation 경고 필터링 (4-1절) |
+
 ---
 
 ## 1. 시스템 아키텍처 다이어그램
@@ -30,6 +44,8 @@
 ┌─────────────────────────────────────────────┴───────────────┐
 │ [로컬 엣지 게이트웨이: Python Fast Engine (PC, server/main.py)]│
 │  - Busy-Dropping Mutex: processing_lock으로 중복 인입 차단   │
+│  - Speaker ID: Resemblyzer 1:N 식별 (VAD 직후, STT 이전)     │
+│  - SpeakerCacheSyncWorker: 10초 주기 화자 캐시 Hot Reload    │
 │  - STT: faster-whisper (base, int8, CPU 구동, ~1.0s)        │
 │  - Intent Engine: 5단계 분기 (호출어/시간룰/부정어/비전/텍스트)│
 │  - RAG Memory: pgvector 검색 + QuestionDetector 동적 완화    │
@@ -44,6 +60,8 @@
 │  - emotion_presets: 감정별 LED RGB 및 복귀 지속시간(SSOT)   │
 │  - interaction_logs: 트리거/감정/발화/레이턴시 텔레메트리    │
 │  - user_long_term_memory: pgvector + Invalidation 소프트 딜리트│
+│  - user_profile_summary: 화자별 페르소나 요약                │
+│  - speaker_profiles: 화자 임베딩 VECTOR(256) + 호칭          │
 └─────────────────────────────────────────────────────────────┘
 
 ```
@@ -123,12 +141,33 @@ ALTER TABLE user_long_term_memory
 
 CREATE INDEX IF NOT EXISTS idx_user_memory_active
 ON user_long_term_memory (user_id) WHERE is_active = TRUE;
+
+-- 5. [Memory Summarization] 사용자 페르소나/선호 성향 요약 프로필
+CREATE TABLE IF NOT EXISTS user_profile_summary (
+    user_id VARCHAR(64) PRIMARY KEY,
+    summary_text TEXT NOT NULL,
+    source_memory_count INT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 6. [다중 사용자 화자 식별] 등록 화자(가족 구성원) 프로필
+-- ⚠️ 절대 DROP하지 않는다 (재기동/스키마 재적용 시 화자 등록 정보 유실 방지).
+--    Resemblyzer d-vector 기준 256차원 고정 (settings.SPEAKER_EMBEDDING_DIM).
+CREATE TABLE IF NOT EXISTS speaker_profiles (
+    user_id VARCHAR(64) PRIMARY KEY,
+    display_name VARCHAR(100) NOT NULL,
+    speaker_embedding VECTOR(256) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
 ### 스키마 설계 노트
 - `interaction_logs`는 STT/RAG/LLM/TTS 구간별 레이턴시를 분리 저장하지 않고 총 소요시간 `latency_ms` 단일 컬럼으로 적재하며, 구간별 분해는 콘솔 로그(`[⏱️ 속도 분석]`)로만 확인합니다.
 - `idx_user_memory_active`는 `is_active = TRUE`에 대한 부분 인덱스로, RAG 검색/Dedup 조회 시 무효화된(과거) 기억을 스캔 대상에서 제외해 조회 비용을 낮춥니다.
 - `superseded_by`는 자기 참조 FK로, 모순 판정 시 무효화되는 구 기억 행이 이를 대체한 신규 기억의 `id`를 가리키도록 하여 기억 계보(lineage)를 추적할 수 있게 합니다.
+- `speaker_profiles`의 Hot Reload 변경 지문은 `(MAX(updated_at), 전체 행 수, 활성 행 수)`입니다. 등록 UPSERT, 호칭 변경, 활성/비활성 전환, EMA 갱신은 모두 `updated_at`을 갱신하고, `updated_at`을 올리지 않는 대시보드의 물리 `DELETE`는 행 수 변화로 감지되어 `SpeakerCacheSyncWorker`가 다음 폴링 주기에 캐시를 재적재합니다.
 
 ---
 
@@ -141,6 +180,7 @@ ON user_long_term_memory (user_id) WHERE is_active = TRUE;
   * `max_output_tokens=1024` 이상 유지하여 비전 모드 한글 멀티바이트 문자열 잘림 방어.
   * **`_extract_json_object()` 공용 Auto-healing 파서**: 마크다운 코드블록 제거 → 바깥쪽 중괄호 슬라이싱(`find`/`rfind`) → 잘린 문자열 자동 괄호 보정(`..."}`) 3단계로 구성되며, `parse_action_json`(감정/대사 추론)과 `classify_memory_relation`(기억 모순 판정) 양쪽이 이 로직을 공유. `json.loads` 단순 교체나 SDK `response_schema` 대체 금지.
   * **재시도/장애 대응**: `503` 응답 시 `MAX_RETRIES` 한도 내 1초 대기 후 재시도, `429` 쿼터 초과 시 즉시 `DEFAULT_LLM_FALLBACK`으로 안전 탈출.
+  * **AFC(자동 함수 호출) 명시적 비활성화**: google-genai SDK는 `tools`가 없어도 AFC를 기본 활성으로 간주해 `Models.generate_content` 첫 호출 시 비권장 경고를 남긴다. Mentio는 function calling을 쓰지 않는 단발성 호출이므로 `Chat` 세션(히스토리 누적)으로 바꾸지 않고, 모든 `GenerateContentConfig`에 `automatic_function_calling=AFC_DISABLED`(`disable=True`)를 지정해 SDK의 단일 요청 경로를 타도록 한다.
 * **장기 기억 검색 (Retrieval, `_retrieve_memory_context`)**:
   * 로컬 경량 임베딩(FastEmbed/ONNX `all-MiniLM-L6-v2`, ~0.05초) → `pgvector` 코사인 유사도 상위 `Top-K=2` 문장만 프롬프트에 `[참고 기억] ...` 형태로 주입.
   * **[v2.2 신규] 의문문 동적 임계값 완화 (`QuestionDetector`)**: 서술문("난 포도 좋아")과 그에 대응하는 질문("무슨 과일 좋아한다고 했지?") 사이 임베딩 비대칭성으로 인해 일반 임계값(`RAG_SIMILARITY_THRESHOLD=0.80`)을 통과하지 못하는 현상을 해소하기 위해, 정규식 기반(`server/services/question_detector.py`) 의문형 어미(`지/까/니/냐/나`)·의문사(`뭐/무엇/무슨/누구/언제/어디/어떻게/왜/얼마`)·회상 질의(`기억나`) 감지 시에만 완화된 `RAG_QUESTION_SIMILARITY_THRESHOLD=0.68`을 적용. LLM 호출 없는 순수 정규식 판별로 지연 추가 없음. `RAG_TOP_K=2` 상한이 그대로 유지되어 완화로 인한 과도한 노이즈 주입은 방어됨.
@@ -158,6 +198,7 @@ ON user_long_term_memory (user_id) WHERE is_active = TRUE;
 * **이원화 비전 처리**:
   * **온디맨드 스냅샷(VLM)**: 영상 상시 스트리밍을 배제하고 필요 시에만 1장 전송하여 대역폭 고갈 및 발열 차단.
   * **로컬 제스처 인식**: PC 웹캠 기반 MediaPipe Hands로 손하트 감지 시 즉각 `HEART_EYES` 및 핫핑크 LED(`[255, 20, 120]`) 표출, `COOLDOWN_SECONDS` 쿨다운 적용.
+  * **protobuf 경고 필터링**: mediapipe 0.10.14 내부(`packet_getter.py`)가 손 랜드마크 검출 시마다 deprecated `SymbolDatabase.GetPrototype()`을 호출한다. protobuf는 mediapipe/streamlit 호환 때문에 `<5`로 고정되어 업그레이드로 해소할 수 없으므로, 유일한 mediapipe 진입점인 `gesture_detector.py`에서 해당 메시지만 좁게 `warnings.filterwarnings`로 억제한다.
 
 ### 2) 데이터베이스 연결 안정성 & 동시성 가드레일 [v2.2 신규 섹션]
 
@@ -172,8 +213,23 @@ ON user_long_term_memory (user_id) WHERE is_active = TRUE;
 * **로컬 고속 STT 엔진 (faster-whisper base, int8)**:
   * CPU int8 양자화 및 스레드 4개 할당으로 1.0~1.2초대 변환 시간 유지.
   * `initial_prompt="멘티오, Mentio"` 주입으로 고유명사 오인식 차단.
-* **화자 식별 (Speaker Verification)**:
-  * 기준 화자의 음성 임베딩 벡터 사전 등록 후 발화 시 코사인 유사도 비교. 임계치 미달(제3자 잡음, TV 소리) 시 파이프라인 진입 차단.
+* **다중 사용자 화자 식별 (`SpeakerService.identify_speaker`, VAD 직후·STT 이전)**:
+  * Resemblyzer 256차원 d-vector를 `speaker_profiles`의 모든 활성 화자와 1:N 코사인 유사도로 비교해 최고 후보를 선택. 어떤 후보와도 임계값 미달(제3자 잡음, TV 소리)이면 파이프라인 진입 차단(Fail-Close). 식별 비활성화(`SPEAKER_VERIFICATION_ENABLED=false`)·등록 화자 전무·처리 예외 시에는 `DEFAULT_USER_ID`로 통과(가용성 우선).
+  * 식별된 `user_id`는 RAG 검색 → 프로필 요약 조회 → 장기 기억 적재까지 일관되게 전달되어 화자별 데이터를 격리하고, `display_name`은 `BrainService` 시스템 프롬프트의 `[현재 대화 상대]` 섹션에 매 턴 동적으로 바인딩.
+  * **실제 발화 길이 기반 커트라인**: 캡처 오디오에는 VAD 사전 버퍼(~0.27s)·종료 무음(0.8s+)이 항상 포함되어 원본 길이로는 단문 판정이 불가능했으므로, Resemblyzer 전처리(webrtcvad 무음 트리밍) 후 **실제 발화 길이**로 분기. 일반 `SPEAKER_VERIFICATION_THRESHOLD=0.65`, `SPEAKER_SHORT_UTTERANCE_MAX_SEC(1.0s)` 이하 단문은 `SPEAKER_SHORT_UTTERANCE_THRESHOLD=0.60`.
+  * **세션 소프트패스**: 직전 통과로부터 `SPEAKER_SESSION_SOFT_PASS_WINDOW_SEC(10s)` 이내 발화는 임계값 미달이어도 통과시키고 직전 화자로 귀속(짧은 맞장구로 세션이 끊기는 현상 방지).
+  * **마진(Margin) 모호성 가드**: 원점수 Top-1/Top-2 차이가 `SPEAKER_MARGIN_THRESHOLD(0.04)` 미만이면 `is_ambiguous=True`. 대화 응답은 정상 진행하되 해당 발화의 **장기 기억 적재를 억제**(`speaker_ambiguous`)해 형제/자매 간 개인 기억 오염 방지.
+  * **대화 세션 락 (Session Lock)**: 마지막 통과 화자를 `SPEAKER_SESSION_TIMEOUT_SEC(120s)` 동안 세션 화자로 유지. 세션 화자는 판정 점수에 `SPEAKER_SESSION_BONUS(+0.03)` 가산, 모호 시 Top-2 안에 있으면 우선권. 다른 화자가 마진 이상 확실히 앞서면 세션 자동 교체. 반환 `similarity`와 EMA 판정에는 항상 가산 전 원점수 사용.
+  * **대화형 호칭 정정 (`SpeakerCorrectionService`)**: "나 민수인데?", "나 민수 아니고 지훈이야"처럼 발화 **전체**가 정정 표현(정규식 룰, LLM 호출 없음)이고 이름이 현재 식별 화자와 다른 활성 화자 정확히 1명과 일치할 때만 세션 화자를 강제 전환하고 사과 멘트("앗, 지훈아 미안해!")로 응답. 내용이 이어지는 발화("나 민수인데 오늘 축구했어")나 미등록 이름은 일반 대화로 처리. 정정 발화는 RAG 적재/EMA 대상에서 제외.
+  * **EMA 점진적 임베딩 갱신**: 원점수 `≥ SPEAKER_EMA_MIN_SIMILARITY(0.82)`, 비모호, 비스킵/비소프트패스, 실제 발화 `≥ SPEAKER_EMA_MIN_SPEECH_SEC(1.0s)`인 고신뢰 발화만 `new = normalize((1 - α)·current + α·input)`, `α = SPEAKER_EMA_ALPHA(0.05)`로 기준 벡터 갱신. DB 쓰기는 TTS 완료 후 `MemoryWriteWorker.submit_speaker_ema()` 순차 큐에서 처리(대화 턴 지연 0).
+* **대화형 음성 온보딩 (`VoiceEnrollmentService`)**:
+  * 상태 머신: `IDLE` →(등록 요청 "내 목소리 등록해줘")→ `WAITING_FOR_NAME` →(이름 응답)→ `WAITING_FOR_VOICE_SAMPLE` × `SPEAKER_ENROLLMENT_REQUIRED_SAMPLES(2)` → 등록 후 `IDLE`. 발화 전체가 취소 표현("그만", "취소")이면 즉시 `IDLE`.
+  * **다중 발화 평균화**: 이름 발화(실제 발화 `≥ 0.5s`일 때만 포함) + 샘플 발화 2회(각 실제 발화 `≥ 1.5s`, 미달 시 재요청)의 임베딩을 평균 후 L2 재정규화해 기준 벡터로 등록.
+  * **중복 등록 가드**: 최근접 기존 화자 유사도 `≥ SPEAKER_ENROLLMENT_DUPLICATE_THRESHOLD(0.85)`면 동일인 재등록으로 보고 새 `user_id`를 발급하지 않고 기존 프로필 목소리만 갱신(호칭 유지). `0.75 ≤ sim < 0.85`(`SPEAKER_ENROLLMENT_SIMILAR_WARNING_THRESHOLD`)면 경고 로그 + "목소리가 비슷해서 헷갈릴 수 있어요" 안내와 함께 신규 등록 허용.
+  * 등록 요청은 식별을 통과한 화자(또는 등록 화자 전무 상태)만 시작 가능. 온보딩 중에는 화자 식별 차단을 바이패스하므로 `SPEAKER_ENROLLMENT_SESSION_TIMEOUT_SEC(30s)` 무응답 시 세션 자동 만료. 등록 직후 캐시 무효화 및 신규 화자를 세션 화자로 지정.
+* **화자 캐시 Hot Reload (`SpeakerCacheSyncWorker`)**:
+  * 전용 데몬 스레드가 `SPEAKER_CACHE_POLL_INTERVAL_SEC(10s)`마다 경량 변경 지문만 조회하고, 지문이 바뀐 경우에만 `refresh_speaker_profiles()`로 캐시를 원자적 교체(Zero-Downtime, 엔진 재기동 불필요).
+  * 발화 처리 중(`is_busy`)이거나 온보딩 진행 중이면 갱신을 다음 주기로 보류. 재적재 결과 수가 지문의 활성 수와 다르거나 조회 도중 캐시 무효화(세대 번호 변경)가 끼어들면 기존 캐시 유지. 비활성화/삭제된 화자가 세션 화자였다면 세션을 해제하고, 호칭 변경 시 세션 호칭도 동기화.
 * **대화 모드 제어 (Conversation Mute)**:
   * **음성 제어**: "대화 그만", "조용히 해" 발화 시 Mute 플래그 활성화.
   * **하드웨어 제어**: 정전식 터치 패드(GPIO 12) 3초 롱터치 시 Mute ON/OFF 토글.

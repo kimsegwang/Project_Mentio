@@ -279,3 +279,39 @@ def test_summarize_profile_returns_empty_string_on_api_exception(service, monkey
     result = service.summarize_profile(["커피를 좋아한다"])
 
     assert result == ""
+
+
+# --- [콘솔 클린업] AFC 비권장 경고 회귀 방지 ---
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda s: s.infer_action(["안녕"]),
+        lambda s: s.classify_memory_relation(
+            "사과 싫어해",
+            [MemoryRecord(id=1, user_id="primary_user", fact_text="사과 좋아해", similarity=0.7, created_at=None)],
+        ),
+        lambda s: s.summarize_profile(["커피를 좋아한다"]),
+    ],
+    ids=["infer_action", "classify_memory_relation", "summarize_profile"],
+)
+def test_all_generate_content_calls_disable_afc(service, monkeypatch, invoke):
+    """AFC가 꺼져 있지 않으면 SDK가 'Direct use of automatic function calling' 경고를 콘솔에 남긴다."""
+    fake_client = _fake_client_returning('{"emotion": "HAPPY", "speech": "안녕!"}')
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    invoke(service)
+
+    config = fake_client.models.generate_content.call_args.kwargs["config"]
+    assert config.automatic_function_calling.disable is True
+    # AFC 설정 추가가 thinking_budget 가드레일을 건드리지 않았는지 함께 확인
+    assert config.thinking_config.thinking_budget == 1
+
+
+def test_afc_disabled_config_takes_sdk_direct_path_without_warning():
+    """실제 SDK 판정 함수 기준으로 AFC 비활성 경로를 타는지 확인한다 (경고/추가 경고 없음)."""
+    from google.genai import _extra_utils, types
+    from server.services.brain_service import AFC_DISABLED
+
+    config = types.GenerateContentConfig(automatic_function_calling=AFC_DISABLED)
+    assert _extra_utils.should_disable_afc(config) is True
