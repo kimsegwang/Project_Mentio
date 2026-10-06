@@ -272,7 +272,7 @@ def test_time_rule_skips_rag_retrieval_and_background_storage(worker, monkeypatc
     monkeypatch.setattr(
         ai_worker_module.intent_service,
         "build_time_response",
-        lambda: LLMResponse(emotion=EmotionType.HAPPY, speech="지금은 오후 3시야!"),
+        lambda text="": LLMResponse(emotion=EmotionType.HAPPY, speech="지금은 오후 3시야!"),
     )
 
     search_mock = Mock()
@@ -285,6 +285,44 @@ def test_time_rule_skips_rag_retrieval_and_background_storage(worker, monkeypatc
     action = worker.process_voice_interaction(audio_data=b"dummy")
 
     assert action.speech == "지금은 오후 3시야!"
+    search_mock.assert_not_called()
+    embed_mock.assert_not_called()
+    submit_mock.assert_not_called()
+
+
+def test_time_rule_passes_user_text_for_date_query(worker, monkeypatch):
+    monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "오늘 며칠이야?")
+    build_mock = Mock(return_value=LLMResponse(emotion=EmotionType.HAPPY, speech="오늘은 2026년 10월 6일 화요일이야!"))
+    monkeypatch.setattr(ai_worker_module.intent_service, "build_time_response", build_mock)
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", Mock())
+
+    action = worker.process_voice_interaction(audio_data=b"dummy")
+
+    build_mock.assert_called_once_with("오늘 며칠이야?")
+    assert action.speech == "오늘은 2026년 10월 6일 화요일이야!"
+    worker.brain_service.infer_action.assert_not_called()
+
+
+def test_weather_rule_skips_llm_rag_and_background_storage(worker, monkeypatch):
+    monkeypatch.setattr(ai_worker_module.stt_service, "transcribe", lambda audio: "오늘 날씨 어때?")
+    weather_mock = Mock(return_value=LLMResponse(emotion=EmotionType.HAPPY, speech="지금 서울은 맑음이고, 기온은 18도야."))
+    monkeypatch.setattr(ai_worker_module.weather_service, "build_weather_response", weather_mock)
+
+    search_mock = Mock()
+    embed_mock = Mock()
+    submit_mock = Mock()
+    log_mock = Mock()
+    monkeypatch.setattr(ai_worker_module, "search_similar_memories", search_mock)
+    monkeypatch.setattr(ai_worker_module.embedding_service, "embed", embed_mock)
+    monkeypatch.setattr(ai_worker_module.memory_write_worker, "submit", submit_mock)
+    monkeypatch.setattr(ai_worker_module, "insert_interaction_log", log_mock)
+
+    action = worker.process_voice_interaction(audio_data=b"dummy")
+
+    weather_mock.assert_called_once_with("오늘 날씨 어때?")
+    assert action.speech == "지금 서울은 맑음이고, 기온은 18도야."
+    assert log_mock.call_args.kwargs["trigger_type"] == TriggerType.VOICE_WEATHER_RULE.value
+    worker.brain_service.infer_action.assert_not_called()
     search_mock.assert_not_called()
     embed_mock.assert_not_called()
     submit_mock.assert_not_called()

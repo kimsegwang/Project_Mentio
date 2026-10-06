@@ -6,6 +6,7 @@ import re
 import time
 import logging
 import warnings
+from datetime import datetime
 from typing import Optional, List, Any
 from google import genai
 from google.genai import types
@@ -14,6 +15,7 @@ from google.genai.errors import APIError
 from config import settings
 from server.schemas.action import LLMResponse, EmotionType
 from server.schemas.memory import MemoryConflictResult, MemoryRecord, MemoryRelation
+from server.services.time_service import format_prompt_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -150,12 +152,15 @@ class BrainService:
         [화자 페르소나 바인딩] 공통 베이스 system_instruction 뒤에 현재 대화 상대의
         display_name 섹션을 덧붙인다. display_name이 없거나 공백이면(미등록/기본 사용자)
         안전한 폴백 문구로 대체해, 로봇이 이름을 지어내 부르지 않도록 한다.
+        [현재 일시 주입] 모델의 학습 시점 연도/시간 환각(예: 2024년)을 막기 위해 매 호출마다
+        로컬 시계 기준 현재 시각을 헤더로 맨 앞에 붙인다 (캐싱하지 않고 매 턴 새로 계산).
         """
         if display_name and display_name.strip():
             persona_section = self.speaker_persona_template.format(display_name=display_name.strip())
         else:
             persona_section = self.speaker_persona_fallback
-        return self.system_instruction + persona_section
+        time_header = format_prompt_timestamp(datetime.now()) + "\n\n"
+        return time_header + self.system_instruction + persona_section
 
     def infer_action(self, contents: List[Any], display_name: Optional[str] = None) -> LLMResponse:
         client = self.get_client()

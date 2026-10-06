@@ -14,6 +14,15 @@ API_TIMEOUT_MS = 10000  # 구글 SDK 기준 10초
 MAX_RETRIES = 1
 COOLDOWN_SECONDS = 6.0
 
+# --- 실시간 날씨(OpenWeatherMap) 설정 ---
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
+# 비어 있으면 외부 호출 없이 "날씨 정보를 받아올 수 없다"는 안내 멘트로 폴백한다 (서버 기동은 막지 않음).
+WEATHER_DEFAULT_CITY = os.getenv("WEATHER_DEFAULT_CITY", "Seoul")
+WEATHER_CACHE_TTL_SEC = int(os.getenv("WEATHER_CACHE_TTL_SEC", "1800"))
+# 날씨는 분 단위로 급변하지 않으므로 30분 캐시. 캐시 적중 시 네트워크 왕복 없이 즉답한다.
+WEATHER_API_TIMEOUT_SEC = 3.0
+# 캐시 미스 시 대화 턴이 블로킹되는 상한. 초과하면 폴백 멘트로 응답해 로봇이 침묵하지 않게 한다.
+
 # --- 비전 처리 설정 ---
 CAMERA_INDEX = 0
 TARGET_IMAGE_WIDTH = 480  # VLM 전송용 가로 리사이징 규격

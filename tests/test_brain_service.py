@@ -136,6 +136,47 @@ def test_infer_action_keeps_thinking_budget_guardrail_with_persona_section(servi
     assert call_kwargs["config"].max_output_tokens >= 1024
 
 
+# --- infer_action(): [현재 일시 주입] 연도/시간 환각 차단용 시스템 프롬프트 헤더 ---
+
+def _fix_brain_now(monkeypatch, fixed):
+    from datetime import datetime
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr("server.services.brain_service.datetime", FixedDateTime)
+
+
+def test_infer_action_injects_current_datetime_header(service, monkeypatch):
+    from datetime import datetime
+
+    _fix_brain_now(monkeypatch, datetime(2026, 10, 6, 20, 24))
+    fake_client = _fake_client_returning('{"emotion": "HAPPY", "speech": "안녕!"}')
+    monkeypatch.setattr(service, "get_client", lambda: fake_client)
+
+    service.infer_action(["올해가 몇 년이지?"], display_name="첫째")
+
+    system_instruction = fake_client.models.generate_content.call_args.kwargs["config"].system_instruction
+    assert system_instruction.startswith("[현재 시각: 2026-10-06 20:24 (화요일), 서울/대한민국 기준]\n\n")
+    # 헤더 주입 이후에도 공통 베이스 프롬프트와 화자 페르소나 섹션은 그대로 유지
+    assert service.system_instruction in system_instruction
+    assert "이름: 첫째" in system_instruction
+
+
+def test_system_instruction_datetime_header_is_recomputed_every_call(service, monkeypatch):
+    from datetime import datetime
+
+    _fix_brain_now(monkeypatch, datetime(2026, 12, 31, 23, 59))
+    first = service._build_system_instruction()
+    _fix_brain_now(monkeypatch, datetime(2027, 1, 1, 0, 1))
+    second = service._build_system_instruction()
+
+    assert "[현재 시각: 2026-12-31 23:59 (목요일)" in first
+    assert "[현재 시각: 2027-01-01 00:01 (금요일)" in second
+
+
 # --- classify_memory_relation(): 모순 판정 ---
 
 def test_classify_memory_relation_skips_llm_call_when_no_candidates(service, monkeypatch):

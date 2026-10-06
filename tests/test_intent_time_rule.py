@@ -160,3 +160,127 @@ def test_build_time_response_midnight_hour_conversion(
     response = service.build_time_response()
 
     assert response.speech == "지금은 오전 12시 0분이야!"
+
+
+# --- [2단계 확장] 룰 기반 날짜/요일 질의 감지 ---
+
+def _fix_now(monkeypatch, fixed: datetime) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr("server.services.intent_service.datetime", FixedDateTime)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "오늘 며칠이야?",
+        "오늘 몇 일이야",
+        "몇 월 며칠이야?",
+        "오늘 무슨 요일이야?",
+        "몇 요일이야",
+        "날짜 알려줘",
+        "오늘 날짜",
+        "며칠이야?",
+        "멘티오야 오늘 며칠이야?",
+    ],
+)
+def test_date_query_routes_to_time_rule(service: IntentService, text: str):
+    trigger_type, needs_vision = service.analyze_voice_intent(text)
+
+    assert trigger_type == TriggerType.VOICE_TIME_RULE.value
+    assert needs_vision is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "여행 며칠 걸려?",
+        "그거 며칠 전에 샀어",
+        "무슨 요일에 만날까?",
+        # 오늘이 아닌 날짜는 오늘 날짜로 즉답하면 틀리므로 LLM(VOICE_CHAT)으로 넘긴다
+        "내일 무슨 요일이야?",
+        "어제 며칠이었지?",
+    ],
+)
+def test_non_today_date_or_duration_is_not_time_rule(service: IntentService, text: str):
+    trigger_type, _ = service.analyze_voice_intent(text)
+
+    assert trigger_type != TriggerType.VOICE_TIME_RULE.value
+
+
+def test_build_time_response_for_date_query(monkeypatch, service: IntentService):
+    _fix_now(monkeypatch, datetime(2026, 10, 6, 20, 24))
+
+    response = service.build_time_response("오늘 며칠이야?")
+
+    assert response.emotion == EmotionType.HAPPY
+    assert response.speech == "오늘은 2026년 10월 6일 화요일이야!"
+
+
+def test_build_time_response_for_weekday_query(monkeypatch, service: IntentService):
+    _fix_now(monkeypatch, datetime(2026, 10, 11, 9, 0))
+
+    response = service.build_time_response("무슨 요일이야")
+
+    assert response.speech == "오늘은 2026년 10월 11일 일요일이야!"
+
+
+def test_build_time_response_for_time_query_with_text(monkeypatch, service: IntentService):
+    _fix_now(monkeypatch, datetime(2026, 10, 6, 20, 24))
+
+    response = service.build_time_response("지금 몇 시야?")
+
+    assert response.speech == "지금은 오후 8시 24분이야!"
+
+
+def test_build_time_response_for_combined_date_and_time(monkeypatch, service: IntentService):
+    _fix_now(monkeypatch, datetime(2026, 10, 6, 20, 24))
+
+    text = "오늘 몇 월 며칠이고 지금 몇 시야?"
+    trigger_type, _ = service.analyze_voice_intent(text)
+    response = service.build_time_response(text)
+
+    assert trigger_type == TriggerType.VOICE_TIME_RULE.value
+    assert response.speech == "오늘은 2026년 10월 6일 화요일, 지금은 오후 8시 24분이야!"
+
+
+# --- [2단계 확장] 룰 기반 날씨 질의 감지 ---
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "날씨 알려줘",
+        "오늘 날씨 어때?",
+        "비 와?",
+        "지금 비 오니?",
+        "눈 와?",
+        "우산 챙겨야 돼?",
+        "기온 몇 도야?",
+        "지금 몇 도야?",
+        "밖에 추워?",
+        "멘티오야 날씨 어때",
+    ],
+)
+def test_weather_query_routes_to_weather_rule(service: IntentService, text: str):
+    trigger_type, needs_vision = service.analyze_voice_intent(text)
+
+    assert trigger_type == TriggerType.VOICE_WEATHER_RULE.value
+    assert needs_vision is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "비 와서 우울해",
+        "비 오는 날 좋아해",
+        "나 추워",
+        "눈 감아",
+    ],
+)
+def test_weather_like_statements_are_not_weather_rule(service: IntentService, text: str):
+    trigger_type, _ = service.analyze_voice_intent(text)
+
+    assert trigger_type != TriggerType.VOICE_WEATHER_RULE.value
