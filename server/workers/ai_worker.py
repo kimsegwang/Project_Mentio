@@ -13,6 +13,7 @@ from server.schemas.action import EmotionType, RobotAction, LLMResponse, Trigger
 from server.services.brain_service import BrainService, brain_service
 from server.services.stt_service import stt_service
 from server.services.intent_service import intent_service
+from server.services.weather_service import weather_service
 from server.services.embedding_service import embedding_service
 from server.services.question_detector import question_detector
 from server.services.speaker_service import SpeakerService, speaker_service
@@ -343,22 +344,33 @@ class AIWorker:
         if correction is not None:
             return self._deliver_speaker_correction(correction, user_text, total_start)
 
-        # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION vs VOICE_TIME_RULE)
+        # 2. 의도 판별 (VOICE_CHAT vs VOICE_VISION vs VOICE_TIME_RULE vs VOICE_WEATHER_RULE)
         t1 = time.time()
         trigger_str, needs_vision = intent_service.analyze_voice_intent(user_text)
         intent_latency = time.time() - t1
+        is_rule_based = trigger_str in (TriggerType.VOICE_TIME_RULE.value, TriggerType.VOICE_WEATHER_RULE.value)
 
         if trigger_str == TriggerType.VOICE_TIME_RULE.value:
-            # 2-1. [룰 기반 즉시 처리] 시간 질의는 Gemini 호출을 건너뛰고 로컬 시계로 즉답
-            prompt_text = f"[룰 기반 즉시 처리] 시간 질의: \"{user_text}\""
-            print(f"⏰ [Rule-based Instant] 시간 질의 감지 (Type: {trigger_str}) -> LLM 호출 스킵, 로컬 시계로 즉답합니다.")
+            # 2-1. [룰 기반 즉시 처리] 시간/날짜 질의는 Gemini 호출을 건너뛰고 로컬 시계로 즉답
+            prompt_text = f"[룰 기반 즉시 처리] 시간/날짜 질의: \"{user_text}\""
+            print(f"⏰ [Rule-based Instant] 시간/날짜 질의 감지 (Type: {trigger_str}) -> LLM 호출 스킵, 로컬 시계로 즉답합니다.")
 
             t2 = time.time()
-            llm_response: LLMResponse = intent_service.build_time_response()
+            llm_response: LLMResponse = intent_service.build_time_response(user_text)
+            gemini_latency = time.time() - t2
+            rag_latency = 0.0
+        elif trigger_str == TriggerType.VOICE_WEATHER_RULE.value:
+            # 2-1'. [룰 기반 즉시 처리] 날씨 질의는 Gemini 호출을 건너뛰고 캐시된 날씨 API 결과로 즉답
+            #       (API 키 부재/실패 시 WeatherService가 안내 멘트로 폴백)
+            prompt_text = f"[룰 기반 즉시 처리] 날씨 질의: \"{user_text}\""
+            print(f"🌤️ [Rule-based Instant] 날씨 질의 감지 (Type: {trigger_str}) -> LLM 호출 스킵, 캐시된 날씨로 즉답합니다.")
+
+            t2 = time.time()
+            llm_response: LLMResponse = weather_service.build_weather_response(user_text)
             gemini_latency = time.time() - t2
             rag_latency = 0.0
         else:
-            # 2-2. [RAG Retrieval] 시간 룰 질의가 아닐 때만 장기 기억 검색 (Top-K=2)
+            # 2-2. [RAG Retrieval] 룰 기반 질의가 아닐 때만 장기 기억 검색 (Top-K=2)
             t_rag = time.time()
             memory_context = self._retrieve_memory_context(user_text, user_id=user_id)
             rag_latency = time.time() - t_rag
@@ -430,7 +442,7 @@ class AIWorker:
         #    MemoryWriteWorker의 순차 큐에 위임해, 연속 발화 시 모순 판정/무효화 순서가
         #    실제 발화 순서와 뒤바뀌는 경쟁 상태를 방지한다.
         #    [화자 모호성 가드] 마진 미달 발화는 다른 가족의 개인 기억 오염 방지를 위해 적재를 억제한다.
-        if trigger_str != TriggerType.VOICE_TIME_RULE.value:
+        if not is_rule_based:
             memory_write_worker.submit(
                 user_text, user_id=user_id, speaker_ambiguous=identification.is_ambiguous
             )
